@@ -1,0 +1,10 @@
+install-*.log
+*.pyc
+__pycache__/
+.venv/
+venv/
+.DS_Store
+*.swp
+*.tar.gz
+state.json
+config.yaml

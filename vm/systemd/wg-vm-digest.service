@@ -1,0 +1,8 @@
+[Unit]
+Description=wg-admin-bot daily VM digest
+
+[Service]
+Type=oneshot
+User=wgbot
+Group=wgbot
+ExecStart=/opt/wg-admin-bot/venv/bin/python3 /opt/wg-admin-bot/digest.py vm

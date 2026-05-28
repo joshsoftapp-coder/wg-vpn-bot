@@ -1,0 +1,36 @@
+[Unit]
+Description=WireGuard Admin Telegram Bot
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+OnFailure=wg-admin-bot-onfailure.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=wgbot
+Group=wgbot
+WorkingDirectory=/opt/wg-admin-bot
+
+# Belt-and-braces: ensure FIFO exists with correct ownership before bot starts.
+# tmpfiles.d should have already created it at boot, but if it was deleted
+# or has wrong perms, this fixes it. The '+' prefix runs this as root.
+ExecStartPre=+/bin/sh -c 'if [ ! -p /run/wg-bot.fifo ]; then rm -f /run/wg-bot.fifo; /usr/bin/mkfifo /run/wg-bot.fifo; fi; /bin/chown wgbot:wgbot /run/wg-bot.fifo; /bin/chmod 622 /run/wg-bot.fifo'
+
+ExecStart=/opt/wg-admin-bot/venv/bin/python3 /opt/wg-admin-bot/bot.py
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wg-admin-bot
+
+# Hardening
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/wg-admin-bot /var/log/wg-admin-bot /run /etc/wireguard /etc/wg-admin-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=wg-admin-bot daily WireGuard digest timer
+
+[Timer]
+OnCalendar=*-*-* 13:05:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning install.sh uninstall.sh \
+            vm/startup.sh vm/watchers/*.sh vm/wg-helpers/reset-admin.sh
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip pyflakes
+          pip install -r vm/bot/requirements.txt
+      - name: compile
+        run: |
+          cd vm/bot
+          python -m compileall -q .
+          python -m py_compile vm/wg-helpers/wg-bot-doctor || \
+            (cd /home/runner/work/*/* && python -m py_compile vm/wg-helpers/wg-bot-doctor)
+      - name: pyflakes
+        run: |
+          cd vm/bot
+          pyflakes *.py
+          cd ..
+          pyflakes vm/wg-helpers/wg-bot-doctor || true
+      - name: verify PTB API surface
+        run: |
+          python tests/verify_ptb_api.py

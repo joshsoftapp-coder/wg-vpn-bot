@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+"""
+wg-bot-doctor — audit, diagnose, and (optionally) repair a wg-vpn-bot install.
+
+Read-only by default. Use --fix to apply automatic remediation for the
+checks that support it.
+
+Usage:
+    sudo wg-bot-doctor                  # full audit, no changes
+    sudo wg-bot-doctor --fix            # audit + apply safe fixes
+    sudo wg-bot-doctor --section bot    # only bot checks
+    sudo wg-bot-doctor --section wg     # only WG checks
+    sudo wg-bot-doctor --section sys    # only filesystem/perms checks
+    sudo wg-bot-doctor --json           # machine-readable output
+    sudo wg-bot-doctor --verbose        # show passing checks too
+
+Sections:
+    sys   filesystem ownership, modes, FIFO, tmpfiles, sudoers, systemd units
+    bot   service state, crash history, Telegram connectivity, state file health
+    wg    kernel<->config consistency, IP allocation, peer/claim mapping
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+# ---------- paths (must match the rest of the codebase) ----------
+WG_CONF = Path("/etc/wireguard/wg0.conf")
+WG_DIR = Path("/etc/wireguard")
+BOT_CONFIG = Path("/etc/wg-admin-bot/config.yaml")
+BOT_STATE = Path("/var/lib/wg-admin-bot/state.json")
+BOT_AUDIT_LOG = Path("/var/log/wg-admin-bot/audit.log")
+BOT_CODE_DIR = Path("/opt/wg-admin-bot")
+SUDOERS = Path("/etc/sudoers.d/wgbot")
+TMPFILES = Path("/etc/tmpfiles.d/wg-admin-bot.conf")
+SAVE_HELPER = Path("/usr/local/sbin/wg-save-restore")
+RESET_HELPER = Path("/usr/local/sbin/wg-bot-reset-admin")
+FIFO = Path("/run/wg-bot.fifo")
+
+# ---------- ui ----------
+USE_COLOR = sys.stdout.isatty()
+C_RED    = "\033[31m" if USE_COLOR else ""
+C_GREEN  = "\033[32m" if USE_COLOR else ""
+C_YELLOW = "\033[33m" if USE_COLOR else ""
+C_CYAN   = "\033[36m" if USE_COLOR else ""
+C_BOLD   = "\033[1m"  if USE_COLOR else ""
+C_DIM    = "\033[2m"  if USE_COLOR else ""
+C_RESET  = "\033[0m"  if USE_COLOR else ""
+
+OK   = f"{C_GREEN}✓{C_RESET}"
+FAIL = f"{C_RED}✗{C_RESET}"
+WARN = f"{C_YELLOW}⚠{C_RESET}"
+INFO = f"{C_CYAN}ℹ{C_RESET}"
+
+
+@dataclass
+class CheckResult:
+    name: str
+    section: str
+    status: str  # "ok" | "warn" | "fail" | "skip"
+    message: str
+    detail: str = ""
+    fixable: bool = False
+    fix_applied: bool = False
+    fix_output: str = ""
+
+
+@dataclass
+class Report:
+    started_at: float = field(default_factory=time.time)
+    checks: list[CheckResult] = field(default_factory=list)
+
+    def add(self, r: CheckResult) -> None:
+        self.checks.append(r)
+
+    def summary(self) -> dict[str, int]:
+        out = {"ok": 0, "warn": 0, "fail": 0, "skip": 0}
+        for c in self.checks:
+            out[c.status] = out.get(c.status, 0) + 1
+        return out
+
+
+# =========== helpers ===========
+
+def _run(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
+    """Run a command, capture output. Doesn't raise."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", f"command not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s"
+    except Exception as e:
+        return 1, "", f"{type(e).__name__}: {e}"
+
+
+def _stat_path(p: Path) -> dict[str, Any] | None:
+    try:
+        st = p.lstat()
+    except FileNotFoundError:
+        return None
+    try:
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        owner = str(st.st_uid)
+    try:
+        import grp
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = str(st.st_gid)
+    return {
+        "owner": owner, "group": group,
+        "mode": stat.S_IMODE(st.st_mode),
+        "mode_str": stat.filemode(st.st_mode),
+        "is_fifo": stat.S_ISFIFO(st.st_mode),
+        "is_dir":  stat.S_ISDIR(st.st_mode),
+        "size": st.st_size,
+    }
+
+
+def _load_yaml(path: Path) -> dict | None:
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        with path.open() as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return None
+
+
+def _load_json(path: Path) -> dict | None:
+    try:
+        with path.open() as f:
+            return json.load(f) or {}
+    except Exception:
+        return None
+
+
+# =========== SYS section ===========
+
+def check_sys_wg_dir(rep: Report, fix: bool) -> None:
+    """Directory must be 750 root:wgbot for the bot to traverse and read.
+
+    750 (not 770) is correct because the bot writes wg0.conf in place
+    (truncate-and-write), not via .tmp + rename. So wgbot needs traverse
+    and list on the dir, but not write access on the dir itself."""
+    s = _stat_path(WG_DIR)
+    if s is None:
+        rep.add(CheckResult("sys.wg_dir.exists", "sys", "fail",
+                            f"{WG_DIR} does not exist",
+                            "Install wireguard package: apt install wireguard"))
+        return
+    if not s["is_dir"]:
+        rep.add(CheckResult("sys.wg_dir.exists", "sys", "fail",
+                            f"{WG_DIR} is not a directory"))
+        return
+    bad = []
+    if s["owner"] != "root": bad.append(f"owner={s['owner']} (want root)")
+    if s["group"] != "wgbot": bad.append(f"group={s['group']} (want wgbot)")
+    if s["mode"] != 0o750: bad.append(f"mode={oct(s['mode'])} (want 0o750)")
+    if not bad:
+        rep.add(CheckResult("sys.wg_dir.perms", "sys", "ok",
+                            f"{WG_DIR} is 750 root:wgbot ✓"))
+        return
+    detail = f"current: {s['mode_str']} {s['owner']}:{s['group']}"
+    if fix:
+        _run(["chown", "root:wgbot", str(WG_DIR)])
+        _run(["chmod", "750", str(WG_DIR)])
+        s2 = _stat_path(WG_DIR)
+        if s2 and s2["owner"] == "root" and s2["group"] == "wgbot" and s2["mode"] == 0o750:
+            rep.add(CheckResult("sys.wg_dir.perms", "sys", "ok",
+                                "Fixed: now 750 root:wgbot", detail,
+                                fixable=True, fix_applied=True))
+            return
+    rep.add(CheckResult("sys.wg_dir.perms", "sys", "fail",
+                        f"{WG_DIR} permissions wrong: {', '.join(bad)}",
+                        detail, fixable=True))
+
+
+def check_sys_wg_conf(rep: Report, fix: bool) -> None:
+    """wg0.conf must be 660 root:wgbot."""
+    s = _stat_path(WG_CONF)
+    if s is None:
+        rep.add(CheckResult("sys.wg_conf.exists", "sys", "fail",
+                            f"{WG_CONF} does not exist",
+                            "WireGuard server config not created. Check startup log."))
+        return
+    bad = []
+    if s["owner"] != "root": bad.append(f"owner={s['owner']} (want root)")
+    if s["group"] != "wgbot": bad.append(f"group={s['group']} (want wgbot)")
+    if s["mode"] != 0o660: bad.append(f"mode={oct(s['mode'])} (want 0o660)")
+    if not bad:
+        rep.add(CheckResult("sys.wg_conf.perms", "sys", "ok",
+                            f"{WG_CONF} is 660 root:wgbot ✓"))
+        return
+    detail = f"current: {s['mode_str']} {s['owner']}:{s['group']}"
+    if fix:
+        _run(["chown", "root:wgbot", str(WG_CONF)])
+        _run(["chmod", "660", str(WG_CONF)])
+        s2 = _stat_path(WG_CONF)
+        if s2 and s2["owner"] == "root" and s2["group"] == "wgbot" and s2["mode"] == 0o660:
+            rep.add(CheckResult("sys.wg_conf.perms", "sys", "ok",
+                                "Fixed: now 660 root:wgbot", detail,
+                                fixable=True, fix_applied=True))
+            return
+    rep.add(CheckResult("sys.wg_conf.perms", "sys", "fail",
+                        f"{WG_CONF} permissions wrong: {', '.join(bad)}",
+                        detail + "\n"
+                        "If this keeps reverting, wg-quick save is being called "
+                        "without the wg-save-restore wrapper.", fixable=True))
+
+
+def check_sys_fifo(rep: Report, fix: bool) -> None:
+    s = _stat_path(FIFO)
+    if s is None:
+        if fix:
+            _run(["mkfifo", str(FIFO)])
+            _run(["chown", "wgbot:wgbot", str(FIFO)])
+            _run(["chmod", "622", str(FIFO)])
+            s2 = _stat_path(FIFO)
+            if s2 and s2["is_fifo"]:
+                rep.add(CheckResult("sys.fifo.exists", "sys", "ok",
+                                    "Fixed: FIFO created", fixable=True, fix_applied=True))
+                return
+        rep.add(CheckResult("sys.fifo.exists", "sys", "fail",
+                            f"{FIFO} does not exist",
+                            "Watchers can't deliver alerts. Restart bot or run "
+                            "systemd-tmpfiles --create /etc/tmpfiles.d/wg-admin-bot.conf",
+                            fixable=True))
+        return
+    if not s["is_fifo"]:
+        rep.add(CheckResult("sys.fifo.exists", "sys", "fail",
+                            f"{FIFO} exists but is not a FIFO ({s['mode_str']})",
+                            "Delete and recreate"))
+        return
+    bad = []
+    if s["owner"] != "wgbot": bad.append(f"owner={s['owner']} (want wgbot)")
+    if s["group"] != "wgbot": bad.append(f"group={s['group']} (want wgbot)")
+    if s["mode"] != 0o622: bad.append(f"mode={oct(s['mode'])} (want 0o622)")
+    if not bad:
+        rep.add(CheckResult("sys.fifo.perms", "sys", "ok",
+                            "FIFO is 622 wgbot:wgbot ✓"))
+        return
+    if fix:
+        _run(["chown", "wgbot:wgbot", str(FIFO)])
+        _run(["chmod", "622", str(FIFO)])
+        rep.add(CheckResult("sys.fifo.perms", "sys", "ok",
+                            "Fixed: FIFO now 622 wgbot:wgbot", fixable=True, fix_applied=True))
+        return
+    rep.add(CheckResult("sys.fifo.perms", "sys", "warn",
+                        f"FIFO perms off: {', '.join(bad)}", fixable=True))
+
+
+def check_sys_tmpfiles_rule(rep: Report, fix: bool) -> None:
+    if not TMPFILES.exists():
+        rep.add(CheckResult("sys.tmpfiles.exists", "sys", "warn",
+                            f"{TMPFILES} missing",
+                            "Without this rule, FIFO won't survive reboot. "
+                            "Recreate manually or reinstall."))
+        return
+    content = TMPFILES.read_text()
+    if "/run/wg-bot.fifo" not in content:
+        rep.add(CheckResult("sys.tmpfiles.rule", "sys", "warn",
+                            "tmpfiles.d rule doesn't mention FIFO",
+                            content))
+        return
+    rep.add(CheckResult("sys.tmpfiles.rule", "sys", "ok",
+                        "tmpfiles.d rule for FIFO present ✓"))
+
+
+def check_sys_sudoers(rep: Report, fix: bool) -> None:
+    if not SUDOERS.exists():
+        rep.add(CheckResult("sys.sudoers.exists", "sys", "fail",
+                            f"{SUDOERS} missing — bot has no privileges"))
+        return
+    rc, out, err = _run(["visudo", "-c", "-f", str(SUDOERS)])
+    if rc != 0:
+        rep.add(CheckResult("sys.sudoers.syntax", "sys", "fail",
+                            "Sudoers file has syntax errors", err or out))
+        return
+    content = SUDOERS.read_text()
+    required = [
+        ("wg set/show", "/usr/bin/wg"),
+        ("wg-quick up wg0", "/usr/bin/wg-quick up wg0"),
+        ("wg-save-restore wrapper", "/usr/local/sbin/wg-save-restore"),
+        ("systemctl restart wg-quick", "/bin/systemctl restart wg-quick@wg0"),
+        ("journalctl", "/usr/bin/journalctl"),
+        ("reboot", "/sbin/reboot"),
+    ]
+    missing = [name for name, needle in required if needle not in content]
+    if missing:
+        rep.add(CheckResult("sys.sudoers.completeness", "sys", "warn",
+                            f"sudoers missing rules: {', '.join(missing)}",
+                            "Some bot commands will fail. Reinstall or restore from v0.2.1."))
+        return
+    rep.add(CheckResult("sys.sudoers", "sys", "ok",
+                        "sudoers present, parses clean, has all expected rules ✓"))
+
+
+def check_sys_helpers(rep: Report, fix: bool) -> None:
+    for path, label in [(SAVE_HELPER, "wg-save-restore"),
+                        (RESET_HELPER, "wg-bot-reset-admin")]:
+        s = _stat_path(path)
+        if s is None:
+            rep.add(CheckResult(f"sys.helper.{label}", "sys", "fail",
+                                f"{label} missing at {path}"))
+            continue
+        executable = bool(s["mode"] & 0o111)
+        if not executable:
+            rep.add(CheckResult(f"sys.helper.{label}", "sys", "warn",
+                                f"{label} not executable ({s['mode_str']})"))
+            continue
+        rep.add(CheckResult(f"sys.helper.{label}", "sys", "ok",
+                            f"{label} present and executable ✓"))
+
+
+def check_sys_systemd_units(rep: Report, fix: bool) -> None:
+    for unit in ["wg-admin-bot.service", "wg-quick@wg0.service",
+                 "wg-vm-digest.timer", "wg-digest.timer",
+                 "wg-bot-disk-check.timer"]:
+        rc, out, _ = _run(["systemctl", "is-enabled", unit])
+        if rc != 0 and "static" not in out:
+            rep.add(CheckResult(f"sys.unit.{unit}", "sys", "warn",
+                                f"{unit} is {out or 'not enabled'}"))
+        else:
+            rep.add(CheckResult(f"sys.unit.{unit}", "sys", "ok",
+                                f"{unit}: {out} ✓"))
+
+
+def check_sys_bot_user(rep: Report, fix: bool) -> None:
+    try:
+        p = pwd.getpwnam("wgbot")
+        rep.add(CheckResult("sys.user.wgbot", "sys", "ok",
+                            f"wgbot user exists (uid={p.pw_uid}, gid={p.pw_gid}, "
+                            f"shell={p.pw_shell})"))
+    except KeyError:
+        rep.add(CheckResult("sys.user.wgbot", "sys", "fail",
+                            "wgbot system user does not exist"))
+
+
+# =========== BOT section ===========
+
+def check_bot_service_state(rep: Report, fix: bool) -> None:
+    rc, active, _ = _run(["systemctl", "is-active", "wg-admin-bot"])
+    if active == "active":
+        rep.add(CheckResult("bot.service.active", "bot", "ok",
+                            "wg-admin-bot service is active ✓"))
+    else:
+        rep.add(CheckResult("bot.service.active", "bot", "fail",
+                            f"wg-admin-bot is {active or 'unknown'}",
+                            "Try: sudo systemctl restart wg-admin-bot\n"
+                            "Investigate: sudo journalctl -u wg-admin-bot -n 100"))
+        return
+
+    # Restart history — if it's been crash-looping, that's a critical signal
+    rc, out, _ = _run(["systemctl", "show", "wg-admin-bot",
+                       "--property=NRestarts,ActiveEnterTimestamp"])
+    nrestarts = 0
+    for line in out.splitlines():
+        if line.startswith("NRestarts="):
+            try:
+                nrestarts = int(line.split("=", 1)[1])
+            except ValueError:
+                pass
+    if nrestarts > 5:
+        rep.add(CheckResult("bot.service.stability", "bot", "warn",
+                            f"Bot has restarted {nrestarts} times since boot",
+                            "Crash-looping behavior. Check logs."))
+    elif nrestarts > 0:
+        rep.add(CheckResult("bot.service.stability", "bot", "ok",
+                            f"Bot has restarted {nrestarts} times (acceptable) ✓"))
+    else:
+        rep.add(CheckResult("bot.service.stability", "bot", "ok",
+                            "Bot has not restarted since service start ✓"))
+
+
+def check_bot_log_health(rep: Report, fix: bool) -> None:
+    """Look for 'Application started' and absence of recent errors."""
+    rc, out, _ = _run(["journalctl", "-u", "wg-admin-bot", "--no-pager",
+                       "-n", "500"], timeout=15)
+    if rc != 0:
+        rep.add(CheckResult("bot.log.access", "bot", "warn",
+                            "Could not read bot log (need root?)"))
+        return
+
+    if "Application started" not in out:
+        rep.add(CheckResult("bot.log.started", "bot", "fail",
+                            "Bot never logged 'Application started'",
+                            "Telegram framework didn't fully initialize. Check for crash before init."))
+    else:
+        rep.add(CheckResult("bot.log.started", "bot", "ok",
+                            "Bot logged 'Application started' ✓"))
+
+    # Look for recent tracebacks
+    lines = out.splitlines()
+    tb_indices = [i for i, ln in enumerate(lines) if "Traceback" in ln]
+    if tb_indices:
+        recent_tb = "\n".join(lines[tb_indices[-1]:tb_indices[-1]+10])
+        rep.add(CheckResult("bot.log.errors", "bot", "warn",
+                            f"Found {len(tb_indices)} traceback(s) in last 500 log lines",
+                            f"Most recent:\n{recent_tb}"))
+    else:
+        rep.add(CheckResult("bot.log.errors", "bot", "ok",
+                            "No tracebacks in last 500 log lines ✓"))
+
+    # Look for permission errors specifically (most common failure mode)
+    perm_errs = [ln for ln in lines if "PermissionError" in ln]
+    if perm_errs:
+        rep.add(CheckResult("bot.log.perm_errors", "bot", "fail",
+                            f"Found {len(perm_errs)} PermissionError(s)",
+                            "\n".join(perm_errs[-3:]) +
+                            "\n\nTry: sudo wg-bot-doctor --fix"))
+
+
+def check_bot_config(rep: Report, fix: bool) -> None:
+    cfg = _load_yaml(BOT_CONFIG)
+    if cfg is None:
+        rep.add(CheckResult("bot.config.parse", "bot", "fail",
+                            f"Cannot parse {BOT_CONFIG}"))
+        return
+
+    tok = cfg.get("telegram", {}).get("bot_token", "")
+    if not tok:
+        rep.add(CheckResult("bot.config.token", "bot", "fail",
+                            "Bot token missing from config"))
+        return
+    if not re.match(r"^\d+:[A-Za-z0-9_-]{30,}$", tok):
+        rep.add(CheckResult("bot.config.token", "bot", "warn",
+                            "Bot token doesn't match expected pattern"))
+    else:
+        rep.add(CheckResult("bot.config.token", "bot", "ok",
+                            f"Bot token present, looks valid (id={tok.split(':')[0]}) ✓"))
+
+    admin = cfg.get("admin", {})
+    aid = admin.get("user_id")
+    if aid is None:
+        ptok = admin.get("pairing_token")
+        pexp = admin.get("pairing_token_expires", 0)
+        if ptok and pexp > time.time():
+            mins = int((pexp - time.time()) / 60)
+            rep.add(CheckResult("bot.config.pairing", "bot", "warn",
+                                f"Unpaired. Token valid for {mins} more minutes.",
+                                f"Send /start {ptok} to the bot."))
+        elif ptok:
+            rep.add(CheckResult("bot.config.pairing", "bot", "warn",
+                                "Unpaired. Pairing token EXPIRED.",
+                                "Run: sudo wg-bot-reset-admin"))
+        else:
+            rep.add(CheckResult("bot.config.pairing", "bot", "warn",
+                                "Unpaired and no pairing token set.",
+                                "Run: sudo wg-bot-reset-admin"))
+    else:
+        rep.add(CheckResult("bot.config.pairing", "bot", "ok",
+                            f"Paired with admin user_id={aid} ✓"))
+
+
+def check_bot_state(rep: Report, fix: bool) -> None:
+    state = _load_json(BOT_STATE)
+    if state is None:
+        rep.add(CheckResult("bot.state.parse", "bot", "warn",
+                            f"Cannot parse {BOT_STATE} (file missing or invalid JSON)"))
+        return
+    admin_uid = state.get("admin_user_id")
+    cfg = _load_yaml(BOT_CONFIG) or {}
+    cfg_admin = cfg.get("admin", {}).get("user_id")
+    if admin_uid is not None and cfg_admin is not None and admin_uid != cfg_admin:
+        rep.add(CheckResult("bot.state.admin_consistency", "bot", "fail",
+                            f"admin_user_id mismatch: state={admin_uid} config={cfg_admin}",
+                            "These should be equal. Run: sudo wg-bot-reset-admin"))
+    else:
+        rep.add(CheckResult("bot.state.admin_consistency", "bot", "ok",
+                            "state.json and config.yaml agree on admin ✓"))
+
+    claims = state.get("peer_chat_ids", {}) or {}
+    invites = state.get("pending_invites", {}) or {}
+    unauth = state.get("unauthorized_dms", []) or []
+    fps = state.get("first_peer_secret")
+    detail = (f"claims: {len(claims)}, pending invites: {len(invites)}, "
+              f"24h unauthorized DMs: "
+              f"{sum(1 for d in unauth if d.get('ts', 0) > time.time() - 86400)}, "
+              f"first_peer_secret stashed: {'yes' if fps else 'no'}")
+    rep.add(CheckResult("bot.state.summary", "bot", "ok", detail))
+
+
+def check_bot_telegram_connectivity(rep: Report, fix: bool) -> None:
+    cfg = _load_yaml(BOT_CONFIG)
+    if not cfg:
+        rep.add(CheckResult("bot.telegram.reachable", "bot", "skip",
+                            "Can't test without config"))
+        return
+    tok = cfg.get("telegram", {}).get("bot_token", "")
+    if not tok:
+        rep.add(CheckResult("bot.telegram.reachable", "bot", "skip",
+                            "No token to test"))
+        return
+
+    # getMe — this is a non-disruptive call
+    try:
+        with urllib.request.urlopen(
+            f"https://api.telegram.org/bot{tok}/getMe", timeout=10
+        ) as resp:
+            j = json.loads(resp.read())
+        if not j.get("ok"):
+            rep.add(CheckResult("bot.telegram.reachable", "bot", "fail",
+                                f"Telegram getMe failed: {j}"))
+            return
+        username = j["result"]["username"]
+        rep.add(CheckResult("bot.telegram.reachable", "bot", "ok",
+                            f"Telegram knows this bot as @{username} ✓"))
+    except urllib.error.HTTPError as e:
+        rep.add(CheckResult("bot.telegram.reachable", "bot", "fail",
+                            f"Telegram returned HTTP {e.code}",
+                            "Token may be wrong or bot deleted from BotFather"))
+    except Exception as e:
+        rep.add(CheckResult("bot.telegram.reachable", "bot", "fail",
+                            f"Telegram unreachable: {e}"))
+
+
+# =========== WG section ===========
+
+def _wg_show_dump() -> list[dict]:
+    """Parse `wg show wg0 dump` output."""
+    rc, out, _ = _run(["wg", "show", "wg0", "dump"])
+    if rc != 0:
+        return []
+    lines = out.splitlines()
+    peers = []
+    for line in lines[1:]:  # skip interface row
+        cols = line.split("\t")
+        if len(cols) < 8:
+            continue
+        peers.append({
+            "pubkey": cols[0],
+            "psk": cols[1] if cols[1] != "(none)" else "",
+            "endpoint": cols[2] if cols[2] != "(none)" else "",
+            "allowed_ips": cols[3],
+            "last_handshake": int(cols[4]) if cols[4].isdigit() else 0,
+            "rx": int(cols[5]) if cols[5].isdigit() else 0,
+            "tx": int(cols[6]) if cols[6].isdigit() else 0,
+        })
+    return peers
+
+
+def _parse_named_peers(text: str) -> list[dict]:
+    """Walk the conf and pair '# name: X' comments with [Peer] blocks."""
+    name_re = re.compile(r"^#\s*name:\s*([A-Za-z0-9_-]{1,32})\s*$")
+    peers = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = name_re.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        j = i + 1
+        while j < len(lines) and not lines[j].strip().startswith("[Peer]"):
+            if lines[j].strip().startswith("[") or name_re.match(lines[j]):
+                break
+            j += 1
+        if j >= len(lines) or not lines[j].strip().startswith("[Peer]"):
+            i += 1
+            continue
+        pub = ""
+        psk = ""
+        ips = ""
+        k = j + 1
+        while k < len(lines):
+            ln = lines[k].strip()
+            if not ln:
+                k += 1
+                continue
+            if ln.startswith("[") or name_re.match(lines[k]):
+                break
+            if ln.lower().startswith("publickey"):
+                pub = ln.split("=", 1)[1].strip()
+            elif ln.lower().startswith("presharedkey"):
+                psk = ln.split("=", 1)[1].strip()
+            elif ln.lower().startswith("allowedips"):
+                ips = ln.split("=", 1)[1].strip()
+            k += 1
+        if pub and ips:
+            peers.append({"name": name, "pubkey": pub, "psk": psk, "allowed_ips": ips})
+        i = k
+    return peers
+
+
+def check_wg_service(rep: Report, fix: bool) -> None:
+    rc, active, _ = _run(["systemctl", "is-active", "wg-quick@wg0"])
+    if active != "active":
+        rep.add(CheckResult("wg.service.active", "wg", "fail",
+                            f"wg-quick@wg0 is {active or 'unknown'}",
+                            "Try: sudo systemctl restart wg-quick@wg0"))
+        return
+    rep.add(CheckResult("wg.service.active", "wg", "ok",
+                        "wg-quick@wg0 is active ✓"))
+
+
+def check_wg_interface_vs_conf(rep: Report, fix: bool) -> None:
+    """The kernel's view of peers must match wg0.conf's view."""
+    kernel_peers = _wg_show_dump()
+    if not kernel_peers and not _run(["systemctl", "is-active", "wg-quick@wg0"])[1] == "active":
+        rep.add(CheckResult("wg.consistency", "wg", "skip",
+                            "wg-quick not running, can't compare"))
+        return
+
+    try:
+        conf_text = WG_CONF.read_text()
+    except PermissionError:
+        rep.add(CheckResult("wg.consistency", "wg", "skip",
+                            "Can't read wg0.conf (run with sudo)"))
+        return
+    except FileNotFoundError:
+        rep.add(CheckResult("wg.consistency", "wg", "fail",
+                            "wg0.conf missing"))
+        return
+
+    # Note: wg-quick save strips all comments from wg0.conf on every call.
+    # So we no longer rely on `# name:` markers for the canonical naming;
+    # peer_names lives in state.json. We still flag pubkey mismatches between
+    # kernel and config — that genuinely indicates corruption.
+    kernel_pubs = {p["pubkey"] for p in kernel_peers}
+
+    # Also include unnamed peers from conf (orphaned [Peer] blocks)
+    raw_pub_re = re.compile(r"^PublicKey\s*=\s*(\S+)", re.MULTILINE)
+    all_conf_pubs = set(raw_pub_re.findall(conf_text))
+
+    if all_conf_pubs == kernel_pubs:
+        rep.add(CheckResult("wg.consistency.pubkeys", "wg", "ok",
+                            f"{len(kernel_pubs)} peer(s), kernel and config agree ✓"))
+    else:
+        in_kernel_only = kernel_pubs - all_conf_pubs
+        in_conf_only = all_conf_pubs - kernel_pubs
+        bits = []
+        if in_kernel_only:
+            bits.append(f"in kernel but not config: {len(in_kernel_only)}")
+        if in_conf_only:
+            bits.append(f"in config but not kernel: {len(in_conf_only)}")
+        rep.add(CheckResult("wg.consistency.pubkeys", "wg", "fail",
+                            "Kernel and config disagree: " + ", ".join(bits),
+                            "Try: sudo systemctl restart wg-quick@wg0"))
+
+    # Check state.json's name map vs kernel
+    state = _load_json(BOT_STATE) or {}
+    names = state.get("peer_names", {}) or {}
+    unnamed_in_kernel = [p for p in kernel_pubs if p not in names]
+    orphan_names = [p for p in names if p not in kernel_pubs]
+    if unnamed_in_kernel:
+        rep.add(CheckResult("wg.names.coverage", "wg", "warn",
+                            f"{len(unnamed_in_kernel)} kernel peer(s) have no name in state.json",
+                            f"Pubkeys: {', '.join(p[:12]+'...' for p in unnamed_in_kernel[:3])}\n"
+                            "These will appear as 'unnamed-xxxx' in /peers."))
+    if orphan_names:
+        rep.add(CheckResult("wg.names.orphans", "wg", "warn",
+                            f"{len(orphan_names)} name(s) in state.json reference missing kernel peers",
+                            "Stale mappings, cosmetic only. They'll be cleaned up on next /remove."))
+    if not unnamed_in_kernel and not orphan_names:
+        rep.add(CheckResult("wg.names", "wg", "ok",
+                            f"All {len(kernel_pubs)} peer(s) have names in state.json ✓"))
+
+
+def check_wg_ip_allocation(rep: Report, fix: bool) -> None:
+    """No two peers should claim the same IP."""
+    kernel_peers = _wg_show_dump()
+    ips: dict[str, list[str]] = {}
+    for p in kernel_peers:
+        for ip in p["allowed_ips"].split(","):
+            ip = ip.strip()
+            if ip and ip != "(none)":
+                ips.setdefault(ip, []).append(p["pubkey"])
+    dups = {ip: pubs for ip, pubs in ips.items() if len(pubs) > 1}
+    if dups:
+        bits = [f"{ip}: {len(pubs)} peers" for ip, pubs in dups.items()]
+        rep.add(CheckResult("wg.ips.unique", "wg", "fail",
+                            "IP allocation conflicts: " + ", ".join(bits),
+                            "Remove duplicates with /remove or via wg set."))
+    else:
+        rep.add(CheckResult("wg.ips.unique", "wg", "ok",
+                            f"All {len(ips)} allocated IP(s) are unique ✓"))
+
+
+def check_wg_external_ip(rep: Report, fix: bool) -> None:
+    """The server's external IP (from GCP metadata) is what peers use as Endpoint."""
+    try:
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/"
+            "network-interfaces/0/access-configs/0/external-ip",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            ext_ip = resp.read().decode().strip()
+        rep.add(CheckResult("wg.external_ip", "wg", "ok",
+                            f"External IP: {ext_ip} ✓"))
+    except Exception as e:
+        rep.add(CheckResult("wg.external_ip", "wg", "warn",
+                            f"Could not read external IP from metadata: {e}",
+                            "Not fatal — only matters for fresh client config rendering."))
+
+
+def check_wg_peer_claims(rep: Report, fix: bool) -> None:
+    """Every claimed peer in state.json should exist as a wg peer."""
+    state = _load_json(BOT_STATE)
+    if state is None:
+        rep.add(CheckResult("wg.claims.consistency", "wg", "skip",
+                            "state.json unreadable"))
+        return
+    claims = state.get("peer_chat_ids", {}) or {}
+    try:
+        conf_text = WG_CONF.read_text()
+    except (PermissionError, FileNotFoundError):
+        rep.add(CheckResult("wg.claims.consistency", "wg", "skip",
+                            "wg0.conf unreadable"))
+        return
+    named = _parse_named_peers(conf_text)
+    peer_names = {p["name"] for p in named}
+    orphan_claims = [n for n in claims if n not in peer_names]
+    if orphan_claims:
+        rep.add(CheckResult("wg.claims.consistency", "wg", "warn",
+                            f"Claims reference missing peers: {orphan_claims}",
+                            "These claims have no peer to deliver configs to. "
+                            "Use /unclaim or remove from state.json."))
+    else:
+        rep.add(CheckResult("wg.claims.consistency", "wg", "ok",
+                            f"All {len(claims)} claim(s) reference existing peers ✓"))
+
+
+def check_wg_handshake_freshness(rep: Report, fix: bool) -> None:
+    kernel_peers = _wg_show_dump()
+    if not kernel_peers:
+        return  # already reported above
+    now = int(time.time())
+    fresh = sum(1 for p in kernel_peers if p["last_handshake"]
+                and (now - p["last_handshake"]) < 300)
+    ever = sum(1 for p in kernel_peers if p["last_handshake"])
+    rep.add(CheckResult("wg.handshakes", "wg", "ok",
+                        f"{fresh}/{len(kernel_peers)} peer(s) connected now, "
+                        f"{ever} ever handshook"))
+
+
+# =========== NET section: NAT, forwarding, outbound interface ===========
+
+def _detect_wan_iface() -> str | None:
+    rc, out, _ = _run(["ip", "route", "get", "8.8.8.8"])
+    if rc != 0:
+        return None
+    m = re.search(r"\bdev\s+(\S+)", out)
+    return m.group(1) if m else None
+
+
+def check_net_ip_forward(rep: Report, fix: bool) -> None:
+    rc, out, _ = _run(["sysctl", "-n", "net.ipv4.ip_forward"])
+    if out.strip() != "1":
+        if fix:
+            _run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+            rep.add(CheckResult("net.ip_forward", "net", "ok",
+                                "Fixed: ip_forward=1 (until reboot)",
+                                "For persistence, ensure /etc/sysctl.d/99-wg-forward.conf "
+                                "contains 'net.ipv4.ip_forward = 1'",
+                                fixable=True, fix_applied=True))
+            return
+        rep.add(CheckResult("net.ip_forward", "net", "fail",
+                            f"net.ipv4.ip_forward = {out!r} (want 1)",
+                            "VPN traffic cannot be routed. "
+                            "Fix: sudo sysctl -w net.ipv4.ip_forward=1",
+                            fixable=True))
+    else:
+        rep.add(CheckResult("net.ip_forward", "net", "ok",
+                            "IP forwarding enabled ✓"))
+
+
+def check_net_wan_iface(rep: Report, fix: bool) -> None:
+    iface = _detect_wan_iface()
+    if not iface:
+        rep.add(CheckResult("net.wan_iface", "net", "fail",
+                            "Could not detect outbound interface",
+                            "ip route get 8.8.8.8 returned no 'dev' field"))
+        return
+    rep.add(CheckResult("net.wan_iface", "net", "ok",
+                        f"Outbound interface: {iface} ✓"))
+
+    # Check wg0.conf references the correct interface
+    try:
+        conf = WG_CONF.read_text()
+    except (PermissionError, FileNotFoundError):
+        return
+    refs = re.findall(r"-o\s+(\S+)\s+-j\s+MASQUERADE", conf)
+    bad = [r for r in refs if r != iface]
+    if bad:
+        rep.add(CheckResult("net.wg_conf_iface", "net", "fail",
+                            f"wg0.conf references wrong interface(s): {bad} "
+                            f"(actual is {iface})",
+                            "VPN traffic won't be NAT'd. Fix:\n"
+                            f"  sudo sed -i 's|-o {bad[0]}|-o {iface}|g' /etc/wireguard/wg0.conf\n"
+                            "  sudo systemctl restart wg-quick@wg0"))
+    elif refs:
+        rep.add(CheckResult("net.wg_conf_iface", "net", "ok",
+                            f"wg0.conf MASQUERADE uses {iface} ✓"))
+
+
+def check_net_masquerade_rule(rep: Report, fix: bool) -> None:
+    iface = _detect_wan_iface()
+    if not iface:
+        return
+    rc, out, _ = _run(["iptables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v"])
+    if rc != 0:
+        rep.add(CheckResult("net.masquerade", "net", "skip",
+                            "Cannot read iptables (need root)"))
+        return
+    # Look for any line that has both MASQUERADE and the correct interface
+    found = False
+    found_wrong = []
+    for ln in out.splitlines():
+        if "MASQUERADE" not in ln:
+            continue
+        # Format includes the out-iface name in a column
+        cols = ln.split()
+        # heuristic: scan for known interface names
+        for tok in cols:
+            if tok == iface:
+                found = True
+            elif tok.startswith(("eth", "ens", "enp", "wlan")) and tok != iface:
+                found_wrong.append(tok)
+    if found:
+        rep.add(CheckResult("net.masquerade", "net", "ok",
+                            f"MASQUERADE rule active for {iface} ✓"))
+    elif found_wrong:
+        if fix:
+            for wrong in found_wrong:
+                _run(["iptables", "-t", "nat", "-D", "POSTROUTING",
+                      "-o", wrong, "-j", "MASQUERADE"])
+            _run(["iptables", "-t", "nat", "-A", "POSTROUTING",
+                  "-o", iface, "-j", "MASQUERADE"])
+            rep.add(CheckResult("net.masquerade", "net", "ok",
+                                f"Fixed: MASQUERADE moved to {iface}",
+                                fixable=True, fix_applied=True))
+            return
+        rep.add(CheckResult("net.masquerade", "net", "fail",
+                            f"MASQUERADE rule attached to wrong interface(s): "
+                            f"{found_wrong} (actual outbound is {iface})",
+                            "VPN traffic won't reach the internet. "
+                            "Use --fix to repair, or also fix wg0.conf for persistence.",
+                            fixable=True))
+    else:
+        rep.add(CheckResult("net.masquerade", "net", "fail",
+                            "No MASQUERADE rule found in iptables POSTROUTING",
+                            "VPN traffic won't be NAT'd to the internet. "
+                            "Try: sudo systemctl restart wg-quick@wg0"))
+
+
+def check_net_forward_rule(rep: Report, fix: bool) -> None:
+    rc, out, _ = _run(["iptables", "-L", "FORWARD", "-n", "-v"])
+    if rc != 0:
+        return
+    if any("wg0" in ln and "ACCEPT" in ln for ln in out.splitlines()):
+        rep.add(CheckResult("net.forward_rule", "net", "ok",
+                            "FORWARD ACCEPT rule for wg0 present ✓"))
+    else:
+        if fix:
+            _run(["iptables", "-A", "FORWARD", "-i", "wg0", "-j", "ACCEPT"])
+            rep.add(CheckResult("net.forward_rule", "net", "ok",
+                                "Fixed: FORWARD ACCEPT rule added for wg0",
+                                fixable=True, fix_applied=True))
+            return
+        rep.add(CheckResult("net.forward_rule", "net", "fail",
+                            "FORWARD chain has no ACCEPT rule for wg0",
+                            "Traffic from wg0 interface won't be forwarded.",
+                            fixable=True))
+
+
+def check_net_outbound_reachable(rep: Report, fix: bool) -> None:
+    rc, _, _ = _run(["ping", "-c", "1", "-W", "2", "8.8.8.8"], timeout=5)
+    if rc == 0:
+        rep.add(CheckResult("net.outbound", "net", "ok",
+                            "VM can reach the internet ✓"))
+    else:
+        rep.add(CheckResult("net.outbound", "net", "warn",
+                            "VM cannot ping 8.8.8.8",
+                            "Outbound ICMP may be blocked even if routing works. "
+                            "This is informational only — TCP may still work."))
+
+
+# =========== orchestration ===========
+
+CHECKS = {
+    "sys": [
+        check_sys_bot_user,
+        check_sys_wg_dir,
+        check_sys_wg_conf,
+        check_sys_fifo,
+        check_sys_tmpfiles_rule,
+        check_sys_sudoers,
+        check_sys_helpers,
+        check_sys_systemd_units,
+    ],
+    "bot": [
+        check_bot_service_state,
+        check_bot_log_health,
+        check_bot_config,
+        check_bot_state,
+        check_bot_telegram_connectivity,
+    ],
+    "wg": [
+        check_wg_service,
+        check_wg_interface_vs_conf,
+        check_wg_ip_allocation,
+        check_wg_external_ip,
+        check_wg_peer_claims,
+        check_wg_handshake_freshness,
+    ],
+    "net": [
+        check_net_ip_forward,
+        check_net_wan_iface,
+        check_net_masquerade_rule,
+        check_net_forward_rule,
+        check_net_outbound_reachable,
+    ],
+}
+
+
+def render_human(rep: Report, verbose: bool) -> None:
+    by_section: dict[str, list[CheckResult]] = {"sys": [], "bot": [], "wg": [], "net": []}
+    for c in rep.checks:
+        by_section.setdefault(c.section, []).append(c)
+
+    icons = {"ok": OK, "warn": WARN, "fail": FAIL, "skip": INFO}
+    titles = {
+        "sys": "FILESYSTEM, PERMISSIONS, SYSTEMD",
+        "bot": "BOT SERVICE, CONFIG, CONNECTIVITY",
+        "wg": "WIREGUARD INTERFACE AND PEER STATE",
+        "net": "NETWORK: IP FORWARDING, NAT, INTERFACES",
+    }
+
+    for section in ["sys", "bot", "wg", "net"]:
+        if not by_section.get(section):
+            continue
+        print(f"\n{C_BOLD}── {titles[section]} ──{C_RESET}\n")
+        for c in by_section[section]:
+            if c.status == "ok" and not verbose:
+                continue
+            icon = icons[c.status]
+            line = f"  {icon} {c.message}"
+            if c.fix_applied:
+                line += f" {C_GREEN}[fixed]{C_RESET}"
+            elif c.fixable and c.status in ("warn", "fail"):
+                line += f" {C_DIM}[--fix available]{C_RESET}"
+            print(line)
+            if c.detail and c.status != "ok":
+                for dl in c.detail.splitlines():
+                    print(f"      {C_DIM}{dl}{C_RESET}")
+
+    # Summary
+    s = rep.summary()
+    total = sum(s.values())
+    print(f"\n{C_BOLD}── SUMMARY ──{C_RESET}")
+    print(f"  {OK} ok:    {s['ok']}/{total}")
+    if s["warn"]:  print(f"  {WARN} warn:  {s['warn']}")
+    if s["fail"]:  print(f"  {FAIL} fail:  {s['fail']}")
+    if s["skip"]:  print(f"  {INFO} skip:  {s['skip']}")
+    if s["fail"] == 0 and s["warn"] == 0:
+        print(f"\n{C_GREEN}{C_BOLD}All clear.{C_RESET}\n")
+    elif s["fail"] == 0:
+        print(f"\n{C_YELLOW}Warnings only — not blocking but worth a look.{C_RESET}\n")
+    else:
+        print(f"\n{C_RED}{C_BOLD}Failures present.{C_RESET} "
+              f"Run with --fix to attempt auto-repair, "
+              f"or investigate manually.\n")
+
+
+def render_json(rep: Report) -> None:
+    print(json.dumps({
+        "started_at": rep.started_at,
+        "summary": rep.summary(),
+        "checks": [asdict(c) for c in rep.checks],
+    }, indent=2))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Audit and (optionally) repair a wg-vpn-bot install.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("--fix", action="store_true",
+                    help="Apply safe automatic fixes for failing checks where possible")
+    ap.add_argument("--section", choices=["sys", "bot", "wg", "net", "all"], default="all",
+                    help="Limit checks to one section (default: all)")
+    ap.add_argument("--json", action="store_true",
+                    help="Output JSON instead of human-readable report")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Show passing checks too (default: only show issues)")
+    args = ap.parse_args()
+
+    if args.fix and os.geteuid() != 0:
+        print(f"{FAIL} --fix requires root. Try: sudo wg-bot-doctor --fix",
+              file=sys.stderr)
+        return 2
+
+    rep = Report()
+    sections = ["sys", "bot", "wg", "net"] if args.section == "all" else [args.section]
+
+    for section in sections:
+        for check in CHECKS[section]:
+            try:
+                check(rep, fix=args.fix)
+            except Exception as e:
+                rep.add(CheckResult(
+                    name=check.__name__,
+                    section=section,
+                    status="fail",
+                    message=f"check {check.__name__} crashed",
+                    detail=f"{type(e).__name__}: {e}",
+                ))
+
+    if args.json:
+        render_json(rep)
+    else:
+        render_human(rep, args.verbose)
+
+    s = rep.summary()
+    if s["fail"]:
+        return 1
+    if s["warn"]:
+        return 0  # warnings are non-blocking for exit code
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

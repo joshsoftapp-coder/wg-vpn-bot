@@ -1,0 +1,43 @@
+# wg-admin-bot scoped privileges (v0.2)
+# Installed at /etc/sudoers.d/wgbot
+# Validate after edits: visudo -c -f /etc/sudoers.d/wgbot
+
+Defaults:wgbot !requiretty
+
+# WireGuard runtime control (used by /add, /remove, /reissue)
+wgbot ALL=(root) NOPASSWD: /usr/bin/wg
+wgbot ALL=(root) NOPASSWD: /usr/bin/wg-quick up wg0
+wgbot ALL=(root) NOPASSWD: /usr/bin/wg-quick down wg0
+wgbot ALL=(root) NOPASSWD: /usr/bin/wg-quick strip wg0
+
+# Wrapper: runs `wg-quick save wg0` then restores root:wgbot 0660 on wg0.conf.
+# wg-quick save uses umask 077 and would otherwise strip our group ownership,
+# making the next read by wgbot fail.
+wgbot ALL=(root) NOPASSWD: /usr/local/sbin/wg-save-restore
+
+# wg0.conf is owned root:wgbot mode 660 — wgbot can edit it directly
+# (no sudo needed). We still need wg/wg-quick under sudo because they
+# touch the kernel interface.
+
+# Service management — scoped
+wgbot ALL=(root) NOPASSWD: /bin/systemctl restart wg-quick@wg0
+wgbot ALL=(root) NOPASSWD: /bin/systemctl start   wg-quick@wg0
+wgbot ALL=(root) NOPASSWD: /bin/systemctl stop    wg-quick@wg0
+wgbot ALL=(root) NOPASSWD: /bin/systemctl status  wg-quick@wg0
+wgbot ALL=(root) NOPASSWD: /bin/systemctl is-active wg-quick@wg0
+wgbot ALL=(root) NOPASSWD: /bin/systemctl restart wg-admin-bot.service
+
+# journalctl reads (for /logs)
+wgbot ALL=(root) NOPASSWD: /usr/bin/journalctl -u wg-quick@wg0 *
+wgbot ALL=(root) NOPASSWD: /usr/bin/journalctl -u wg-admin-bot *
+wgbot ALL=(root) NOPASSWD: /usr/bin/journalctl -u ssh *
+
+# Apt — security only, no arbitrary install
+wgbot ALL=(root) NOPASSWD: /usr/bin/apt-get update
+wgbot ALL=(root) NOPASSWD: /usr/bin/apt-get -y -s upgrade
+wgbot ALL=(root) NOPASSWD: /usr/bin/apt-get -y upgrade
+
+# OS lifecycle — destructive, gated by YES confirmation in the bot
+wgbot ALL=(root) NOPASSWD: /sbin/reboot
+wgbot ALL=(root) NOPASSWD: /sbin/shutdown -h now
+wgbot ALL=(root) NOPASSWD: /sbin/shutdown -r now

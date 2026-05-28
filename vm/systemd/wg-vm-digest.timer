@@ -1,0 +1,10 @@
+[Unit]
+Description=wg-admin-bot daily VM digest timer
+
+[Timer]
+OnCalendar=*-*-* 13:00:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

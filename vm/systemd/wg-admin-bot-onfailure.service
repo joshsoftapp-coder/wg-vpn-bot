@@ -1,0 +1,16 @@
+[Unit]
+Description=wg-admin-bot crash notifier
+
+[Service]
+Type=oneshot
+User=wgbot
+Group=wgbot
+ExecStart=/bin/bash -c '\
+  BOT_TOKEN=$(grep -oP "bot_token: *\"\K[^\"]+" /etc/wg-admin-bot/config.yaml); \
+  ADMIN_ID=$(jq -r ".admin_user_id // empty" /var/lib/wg-admin-bot/state.json 2>/dev/null); \
+  if [ -n "$BOT_TOKEN" ] && [ -n "$ADMIN_ID" ]; then \
+    HOST=$(hostname); \
+    MSG="🔴 wg-admin-bot crashed on $HOST. systemd will retry. journalctl -u wg-admin-bot -n 50 for details."; \
+    curl -s -m 10 -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+      -d "chat_id=$ADMIN_ID" --data-urlencode "text=$MSG" >/dev/null || true; \
+  fi'
