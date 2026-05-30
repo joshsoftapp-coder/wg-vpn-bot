@@ -19,15 +19,15 @@ Who we're defending against, with realistic threats:
   exploits. Mitigated by: only UDP/51820 exposed, no SSH on internet, no
   web UI.
 - **Telegram strangers DMing the bot** — anyone can find the bot via its
-  username and DM it. The bot ignores anyone who isn't the admin or a
-  claimed peer. Logged in a daily summary.
+  username and DM it. The bot ignores anyone who isn't the admin. Logged
+  in a daily summary.
 - **Telegram account compromise of the admin** — this is the weakest link.
   Mitigations: (a) admin enables Telegram 2FA, (b) destructive commands
   require explicit `YES`, (c) re-pairing requires physical/IAP access to
   the VM.
-- **Telegram account compromise of a peer** — affects only that peer's
-  ability to be DM'd by the bot; doesn't compromise the VPN itself. Admin
-  can `/unclaim` the affected peer.
+- **Loss/theft of a peer's device** — affects only that peer's tunnel.
+  Admin runs `/remove NAME YES` to kill the stolen config server-side,
+  then `/add NAME` to issue a fresh one for the replacement device.
 - **GCP account compromise of the admin** — out of scope. They have the
   cloud console; the bot is a sideshow at that point.
 
@@ -65,10 +65,9 @@ Who we're explicitly **not** defending against:
               │ Telegram bot token      │  ← long-poll API access
               └─────────────────────────┘
                           │
-              ┌───────────┴────────────┐
-              ▼                        ▼
-         admin user_id          peer user_ids
-        (TOFU paired)         (TOFU claimed)
+                          ▼
+                   admin user_id
+                  (TOFU paired)
 ```
 
 Each level is a different identity:
@@ -76,7 +75,8 @@ Each level is a different identity:
 - sudoers → unix user, not network identity
 - wgbot → can do operational things, can't escalate
 - bot token → Telegram, distinct from admin's Telegram account
-- admin/peer user_ids → identified by Telegram's user_id (an integer)
+- admin user_id → Telegram's user_id integer (a peer's user_id is not
+  tracked; peers don't interact with the bot)
 
 ## Why these choices
 
@@ -178,53 +178,61 @@ v0.2 uses the native approach:
 - **Adding a peer:** `wg set wg0 peer PUBKEY allowed-ips IP` (kernel state)
   + `wg-quick save wg0` (writes to wg0.conf)
 - **Removing a peer:** `wg set wg0 peer PUBKEY remove` + `wg-quick save`
-- **Listing peers:** parse wg0.conf for `# name: X` comments paired with
-  `[Peer]` blocks
+- **Listing peers:** read kernel state via `wg show wg0 dump` for membership
+  and IPs, then join names from `state.json` (see below)
 - **IP allocation:** read `wg show wg0 allowed-ips` for ground truth
 
 We dropped pause/resume entirely. To disable a peer, remove them.
-Re-adding takes about three seconds via `/add NAME` + `/invite NAME`.
+Re-adding takes about three seconds via `/add NAME`.
 
-### Why a comment-marker for peer names
+### Why peer names live in state.json, not in wg0.conf comments
 
-WireGuard's config format doesn't have a "Name" field on `[Peer]` blocks.
-The native tool's view of a peer is just `(public key, preshared key,
-allowed IPs)`.
+WireGuard's config format has no "Name" field on `[Peer]` blocks. The
+native tool's view of a peer is just `(public key, preshared key, allowed
+IPs)`. We need to map our human-friendly names to public keys somewhere.
 
-To map our human-friendly peer names to public keys, we need to store the
-mapping somewhere. Options were:
+**v0.1–v0.2.4 stored names as `# name: X` comments in wg0.conf.** This was
+wrong. `wg-quick save` serializes kernel state via `wg showconf`, which
+strips **all** comments on every save. So every peer add or remove erased
+every other peer's name — the first peer's name vanished as soon as a
+second peer was added. This bug shipped latent for several versions because
+earlier failures blocked us from ever reaching a multi-peer state on a real
+VM.
 
-- **External database** (sqlite, JSON file): adds a second source of truth
-  that has to be kept in sync with wg0.conf.
-- **Comment lines in wg0.conf**: `wg-quick save` preserves comment lines.
-  Single source of truth.
+**v0.2.5 onward: names live in `state.json`** as a `peer_names` dict of
+`{pubkey: name}`. `state.json` is owned by the bot (`wgbot:wgbot 0600`) and
+written in place, so it survives every `wg-quick save`. Peer membership and
+IPs still come from the kernel (the real source of truth for "who can
+connect"); only the human label comes from `state.json`.
 
-We chose comments. The format is `# name: <peer_name>` on a line
-immediately above the `[Peer]` block. Anything else in wg0.conf is
-WireGuard's business.
+We still write a `# name:` comment into wg0.conf at creation time as a
+courtesy for anyone reading the file by hand — but no code relies on it,
+and it's expected to be stripped on the next save. On upgrade from an older
+version, `list_peers()` does a one-shot bootstrap: if `peer_names` is empty
+but comments survive in the conf, it recovers names from them and persists
+to `state.json`.
 
-When `wg set ... peer NEW remove` runs, `wg-quick save` rewrites wg0.conf
-without that peer's block, but our comment may stick around (since it's
-not technically part of the block). We sweep for orphan `# name:` lines
-after every remove.
+### One identity, not two: the dropped claim flow
 
-### Why a chat_id binding separate from the WG peer
+Earlier designs had a second "claim" identity binding a Telegram `chat_id`
+to a peer, so the bot could DM peers directly (reissues, outage notices).
+The `/claim`, `/invite`, `/unclaim`, and `/leave` commands implemented this.
 
-Two distinct identities:
-- **WG identity** — (private key, public key, IP, allowed-IPs, allowed
-  endpoints). Has nothing to do with Telegram.
-- **Telegram identity** — (user_id, username, chat_id). Has nothing to do
-  with WG.
+**As of v0.2.6 the claim flow is disabled.** It was buggy, and it added a
+whole second identity model (and second source of truth) for marginal
+benefit. The code is preserved but unregistered in `bot.py`, so it can be
+revived later if wanted.
 
-A peer can have one and not the other:
-- Have WG, no claim → admin couriers config out of band (cheap, simple)
-- Have claim, no WG → claim is harmless; bot just can't deliver anything
-  useful until WG identity exists
-- Have both → bot DMs reissues directly, sends planned-outage messages
+The current model is simpler: a peer is **only** a WG identity (private
+key, public key, IP). There is no Telegram binding. The admin creates a
+peer with `/add`, receives the config, and couriers it to the peer through
+whatever channel they already use (AirDrop, Signal, WhatsApp, email, in
+person). Peers never interact with the bot at all — they just import a
+`.conf` into the WireGuard app.
 
-Keeping them orthogonal means `/reissue` doesn't disturb claims, and
-`/unclaim` doesn't disturb VPN access. That orthogonality is the
-foundation of the three-destruction-commands model.
+This means `/reissue` and `/remove` both deliver their result to the admin,
+who forwards as needed. No `chat_id`, no claim bindings, no peer-facing
+Telegram surface to secure.
 
 ### Why YES confirmations
 
@@ -279,17 +287,19 @@ VMs but accepts that ~$7/month cost.
 ### Files on the VM
 
 ```
-/etc/wireguard/wg0.conf          server config + peers + # name comments
+/etc/wireguard/wg0.conf          server config + peers
                                  root:wgbot 0660 (so wgbot can edit)
+                                 (peer names live in state.json, not here)
 /etc/wireguard/server.key        backup of server private key
                                  root:root 0600
 
 /etc/wg-admin-bot/config.yaml    bot config (token, admin id, schedules)
-                                 root:wgbot 0640
-                                 (See "config.yaml schema" below.)
+                                 root:wgbot 0660
+                                 (0660 not 0640: the bot writes admin_id
+                                 and pairing tokens here. See schema below.)
 
-/var/lib/wg-admin-bot/state.json runtime state (claims, invites,
-                                 unauthorized DM log, etc.)
+/var/lib/wg-admin-bot/state.json runtime state (peer_names, unauthorized
+                                 DM log, etc.)
                                  wgbot:wgbot 0600
 
 /var/log/wg-admin-bot/audit.log  append-only audit trail
@@ -301,7 +311,7 @@ VMs but accepts that ~$7/month cost.
 /etc/sudoers.d/wgbot             scoped allowlist for wgbot
                                  root:root 0440
 
-/usr/local/sbin/wg-bot-*         helper scripts (reset-admin, watchers)
+/usr/local/sbin/wg-bot-*         helper scripts (reset-admin, doctor, watchers)
                                  root:root 0755
 
 /run/wg-bot.fifo                 named pipe; watchers → bot
@@ -337,10 +347,7 @@ first_peer:
 ```json
 {
   "admin_user_id": 12345,
-  "peer_chat_ids": { "alice": 67890, "bob": 11111 },
-  "pending_invites": {
-    "ABCD-EFGH-IJKL": { "peer_name": "carol", "expires": 1716220000 }
-  },
+  "peer_names": { "DEF=": "vpn-a3f9", "JKL=": "johna" },
   "unauthorized_dms": [
     {"ts": 1716200000, "user_id": 999, "username": "rando", "text": "hi"}
   ],
@@ -348,11 +355,16 @@ first_peer:
 }
 ```
 
+`peer_names` maps WireGuard public keys to human names — the canonical
+name mapping (see "Why peer names live in state.json"). The disabled claim
+flow's keys (`peer_chat_ids`, `pending_invites`) are no longer written;
+old installs may still carry them harmlessly.
+
 Two state stores by design:
 - `config.yaml` for things that survive bot restarts and are
   human-editable (bot token, schedules, subnet)
-- `state.json` for ephemeral runtime data that the bot owns and rewrites
-  frequently
+- `state.json` for runtime data that the bot owns and rewrites
+  frequently (peer names, unauthorized-DM log)
 
 ### wg0.conf example
 
@@ -361,37 +373,50 @@ Two state stores by design:
 Address = 10.13.13.1/24
 ListenPort = 51820
 PrivateKey = ABC=
-PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+# The outbound interface is detected at install time via
+# `ip route get 8.8.8.8`. On GCP Debian 12 it's ens4; on other clouds /
+# distros it may be eth0 or enp0s*. Hardcoding eth0 would break NAT.
+PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ens4 -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ens4 -j MASQUERADE
 
-# name: vpn-a3f9
 [Peer]
 PublicKey = DEF=
 PresharedKey = GHI=
 AllowedIPs = 10.13.13.2/32
 
-# name: alice
 [Peer]
 PublicKey = JKL=
 PresharedKey = MNO=
 AllowedIPs = 10.13.13.3/32
 ```
 
+The bot also writes `# name: <name>` comments at peer-creation time, but
+they're stripped on the next `wg-quick save` so they're not shown above.
+The authoritative name mapping is in `state.json`'s `peer_names` dict.
+
 ## Module layout
 
 ```
 vm/bot/
 ├── bot.py          ~700 lines — Telegram handlers, dispatcher
-├── wg_cmds.py      ~360 lines — WG peer ops (add/remove/reissue/list)
+├── wg_cmds.py      ~470 lines — WG peer ops; name map; in-place writes
 ├── vm_cmds.py      ~120 lines — VM ops (status/reboot/update/logs)
-├── claim.py        ~95 lines  — invite/claim flow, chat_id binding
+├── claim.py        ~95 lines  — invite/claim flow (disabled; handlers
+│                                unregistered in v0.2.6; code preserved
+│                                for possible future re-enable)
 ├── auth.py         ~85 lines  — TOFU pairing, audit log
 ├── alerts.py       ~95 lines  — FIFO listener, batching
-├── config.py       ~90 lines  — YAML loader, atomic save
-├── state.py        ~55 lines  — JSON state store
-├── digest.py       ~125 lines — daily VM + WG digests
+├── config.py       ~85 lines  — YAML loader, in-place save
+├── state.py        ~50 lines  — JSON state store, in-place writes
+├── digest.py       ~165 lines — daily VM + WG digests, on-demand /digest
 ├── cli.py          ~45 lines  — first-peer creation for startup.sh
 └── requirements.txt
+
+vm/wg-helpers/
+├── reset-admin.sh           — sudo wg-bot-reset-admin
+├── wg-save-restore.sh       — wraps wg-quick save to restore wg0.conf perms
+└── wg-bot-doctor            — read-only audit + optional --fix (4 sections:
+                                sys, bot, wg, net)
 ```
 
 Each module has one job. `bot.py` is the only one that imports Telegram
@@ -477,13 +502,52 @@ root or otherwise privileged. Defense-in-depth that costs nothing.
 - SSH to VM (uses Google identity, not Telegram)
 - `sudo wg-bot-reset-admin`
 - New pairing token printed; pair from new Telegram account
-- All peers must re-claim, but their WG configs still work
+- Peers are unaffected: their WG configs keep working throughout
 
 ### VM is fully unreachable
 - Most likely: GCP outage in that region, or accidental shutdown
 - Restart via GCP Console
 - Last-resort: `./uninstall.sh && ./install.sh` from your laptop
 - All peer configs become invalid; everyone needs a fresh config
+
+### VM is suspected compromised (or just in a corrupted state you can't diagnose)
+
+**Recommended path: purge and rebuild.** This is the disposable-by-design
+recovery, and it's by far the cleanest.
+
+```bash
+./uninstall.sh OLD_PROJECT_ID
+./install.sh                  # makes a new GCP project, new VM, new keys
+                              # /add each peer fresh
+                              # send each peer their new config
+```
+
+Why this is fine to do casually: the VM has nothing on it worth stealing
+back. The "secrets" on the box are:
+
+- The WireGuard server private key — useless to an attacker because peers
+  re-derive trust from the new server when they import the new config.
+- Peer public keys and human-friendly names. The names you chose
+  (`johna`, `vpn-a3f9`, etc.) are at most mildly embarrassing.
+- The Telegram bot token — rotate it via @BotFather if you want; otherwise
+  it just stops being polled by anything once the VM is gone.
+- The audit log of who DM'd the bot. Not sensitive.
+
+There's no user data, no browsing history, no stored credentials. The VM
+is a stateless WireGuard server with a small management bot. Rebuilding
+takes ~10 minutes and the only inconvenience to peers is "import the new
+config your admin just sent you."
+
+This is the same response as a peer device theft, scaled up: nuke the
+affected key material, reissue. The architecture is built for it —
+that's why there's no SLA, no backups, no migration tooling.
+
+When you might **not** want a full rebuild:
+- The compromise is unconfirmed and rebuilding is more disruption than
+  it's worth. `sudo wg-bot-doctor --verbose` first; it'll surface most
+  classes of misconfiguration without any guessing.
+- You suspect only the admin Telegram account, not the VM itself. Then
+  `sudo wg-bot-reset-admin` is enough (covered above).
 
 ## Performance notes
 
@@ -506,7 +570,7 @@ workload. Most of the 1 GB is unused.
 | Setup time | ~10 min | ~30 min | ~1 hour |
 | Public attack surface | UDP/51820 only | UDP/51820 + TCP/51821 | UDP/51820 |
 | Phone-based admin | Yes | Half (web UI) | No |
-| Phone-based peer onboarding | Yes (`/claim`) | No | No |
+| Phone-based peer onboarding | N/A — admin couriers config | No | No |
 | Maintenance | `/update` from phone | SSH | SSH |
 | Tested at scale | No (≤10 peers) | Yes (thousands) | Yes (thousands) |
 | You wrote it | Yes | No | No |
@@ -527,8 +591,10 @@ These are intentionally not built and not planned:
 - **A REST API** — same.
 - **Multiple admins** — the trust model assumes one. Two would need a
   consensus mechanism for destructive commands or risk fighting.
-- **OAuth-style claims (Telegram Login Widget)** — overcomplicated for
-  the use case; TOFU+token is enough.
+- **Reviving the peer claim flow** — the `/claim` / `/invite` flow exists
+  in the code but is unregistered (v0.2.6+). Reviving it would need
+  another debugging pass; the current "admin couriers configs" model is
+  simpler and good enough for the target use case.
 
 If you want any of these, fork it and have fun. The codebase is small
 enough to make that easy.

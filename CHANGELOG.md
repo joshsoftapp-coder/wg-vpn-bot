@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.10 — 2026-05-30
+
+Critical bug: `/reboot YES` silently unpaired the admin on every reboot.
+
+### Root cause
+
+GCP runs the startup script (`vm/startup.sh`) on **every VM start**, not
+just the first boot. The script unconditionally overwrote
+`/etc/wg-admin-bot/config.yaml` (wiping the paired `admin_user_id` back
+to null) and `/var/lib/wg-admin-bot/state.json` (wiping peer names) on
+every reboot. The bot would restart, send "🟢 wg-admin-bot online" (from
+its `post_init` hook, using the stale `admin_id` still in memory), then
+fail to respond to any further commands because the newly-loaded config
+had `admin_user_id: null` and every handler's `@admin_only` check saw a
+stranger.
+
+The comment at the top of startup.sh even said "Runs once at first boot"
+— this was simply wrong about GCP's behaviour.
+
+### Fix
+
+Three guards added to startup.sh:
+
+- **config.yaml + state.json**: only copied/initialised if config.yaml
+  is absent OR has `admin.user_id: null` (i.e. not yet paired). On
+  subsequent boots the existing files are preserved; only ownership/mode
+  are re-applied.
+- **bot code + venv**: only copied/installed if the venv doesn't exist
+  yet. Saves ~30s of unnecessary pip install on every reboot.
+- **audit.log**: only initialised on first boot (was previously truncated
+  on every reboot).
+
+The wg0.conf and first-peer creation were already correctly guarded; this
+fix brings config/state/code into line with the same pattern.
+
 ## 0.2.9 — 2026-05-28
 
 Correct root-cause fix for the missing VM digest. v0.2.8 fixed the wrong

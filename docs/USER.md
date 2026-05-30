@@ -1,174 +1,88 @@
 # USER.md — for peers (users of the VPN)
 
-If you've been told "here's a VPN, use Telegram to get your config" — this
-is the guide for you.
+If someone set up a VPN for you and sent you a config file, this is your
+guide. It takes about two minutes.
 
 ## What you'll get
 
-A WireGuard VPN config that routes all your traffic through a private
-server. You'll import it into the WireGuard mobile or desktop app.
+Your admin will send you a WireGuard config — either a file named something
+like `johna.conf`, or a QR code image, or both. They'll send it through
+whatever channel you already use with them (WhatsApp, Signal, email, AirDrop,
+in person). You do **not** need Telegram, an account, or any login. You just
+import the config into the free WireGuard app.
 
-## Setup, in 4 steps
+## Setup
 
-### 1. Receive the invite token from your admin
+### On your phone
 
-The admin will send you something that looks like this, through any channel
-(WhatsApp, SMS, in person):
+1. Install the **WireGuard** app from the App Store or Google Play.
+2. Open it, tap the **+** button.
+3. Choose **Create from QR code** and scan the QR your admin sent — or
+   choose **Create from file or archive** and pick the `.conf` file.
+4. Give it any name you like (e.g. "My VPN").
+5. Toggle it **on**.
 
-> Send this to **@your_vpn_bot** in Telegram:
-> `/claim ABCD-EFGH-IJKL`
-> (Expires in 30 minutes.)
+### On a computer
 
-### 2. Open Telegram and find the bot
-
-Search Telegram for the bot's username (`@your_vpn_bot` in the example
-above). Tap it.
-
-**Telegram quirk:** the first time you open a chat with a bot, you'll
-see a **Start** button instead of a text input. Press it. The bot will
-send back a welcome message. Now you can type.
-
-### 3. Send the claim command
-
-Now that the text input is showing, type and send the exact `/claim
-ABCD-EFGH-IJKL` line you received.
-
-If everything is fine, the bot will reply:
-
-> ✅ Claimed peer 'alice'.
-> Your admin will now /reissue your config — you'll receive it here shortly.
-
-### 4. Import the config the admin sends
-
-A moment later, the admin will run `/reissue` and you'll receive **two
-messages from the bot**:
-
-- A file: `alice.conf`
-- An image: a QR code
-
-**On your phone:**
-1. Install the WireGuard app from the App Store / Play Store
-2. Open it, tap "+", choose "Create from QR code"
-3. Scan the QR code (you can scan it from the same Telegram screen if you
-   only have one device — let me know if you need a workaround)
-4. Toggle the connection on
-
-**On a computer:**
-1. Install the WireGuard app from <https://www.wireguard.com/install/>
-2. Download the `.conf` file from Telegram
-3. In the WireGuard app: "Import tunnel(s) from file"
-4. Click "Activate"
+1. Install WireGuard from <https://www.wireguard.com/install/>.
+2. Save the `.conf` file your admin sent you.
+3. In the WireGuard app: **Import tunnel(s) from file**, pick the `.conf`.
+4. Click **Activate**.
 
 ## You're connected
 
-That's it. Your traffic is now going through the VPN.
+That's it — your traffic now routes through the VPN server.
 
-You can check that the VPN is working by:
-- Visiting <https://whatismyipaddress.com> — should show the server's IP, not yours
-- The WireGuard app should show "Active" with bytes counting up
+Check it's working:
+- Visit <https://whatismyipaddress.com> — it should show the server's
+  location, not yours.
+- The WireGuard app shows "Active" with the data counters ticking up.
 
-## What the bot will say to you, ever
-
-After claiming, the bot will DM you only in three situations:
-
-- **You requested it** — the admin runs `/reissue` (new config) and you get
-  the new files
-- **Planned outage** — "VPN is rebooting (~60 seconds)" or "VPN is shutting
-  down" — so you know it's planned, not broken
-- **Acknowledgment of your /leave** — see below
-
-The bot does **not** send you alerts when the VPN goes briefly offline by
-itself, when other peers connect, or anything else. If your connection
-drops, your phone will reconnect automatically when the server is back.
-
-## What you can do
-
-You have exactly **one** command:
-
-```
-/leave YES
-```
-
-This removes your peer from the VPN. Your config stops working immediately.
-The admin is notified. You can ask the admin for a new invite later if you
-change your mind.
-
-Sending `/leave` without `YES` will ask for confirmation first.
-
-Any other commands you try will get a polite "your only command here is
-/leave YES" reply.
+To pause the VPN, toggle it off in the app. To resume, toggle it on. Your
+phone reconnects automatically if the connection briefly drops.
 
 ## Things to know
 
-### If you lose your phone or get a new one
+### This VPN routes all your traffic
 
-Tell the admin. They'll run `/reissue alice` (assuming your peer is named
-`alice`). The bot will DM you the new config directly — no claim needed,
-because you're already claimed.
+While the tunnel is on, all your internet traffic goes through the server.
+That's the point — it hides your traffic from the local network (coffee-shop
+wifi, hotel, airport) and makes you appear to be in the server's location.
 
-If you also lost your Telegram account, see "If your Telegram got
-compromised" below.
+### If you get a new phone or lose your config
 
-### If your Telegram got compromised
+Just ask your admin to send you the config again, or to issue a fresh one.
+There's nothing for you to "recover" — the config is a small text file.
 
-Tell the admin immediately. They'll:
-1. `/unclaim alice` — bot stops being able to DM your old account
-2. `/reissue alice` — new VPN config issued
-3. `/invite alice` — fresh claim token, sent to you via a different channel
-4. You claim with the new token from your new Telegram account
+### If your device is lost or stolen
 
-Your VPN access is fully reset.
-
-### If you didn't actually need the VPN and want to go away
-
-```
-/leave YES
-```
-
-You're done. The peer is removed. You can block the bot in Telegram if you
-want — it won't be able to DM you again anyway.
+Tell your admin. They can remove your peer from the server so the lost
+config stops working, and issue you a new one for your replacement device.
 
 ### Privacy
 
-The bot stores:
-- Your Telegram user_id (bound to your peer name)
-- Your username at claim time, for the admin's reference
-
-The bot does **not** store:
-- Your WireGuard private key — that's only ever on your device
-- Your Telegram messages — they pass through Telegram normally
-- Your IP, location, or browsing — the VPN server sees your traffic but
-  doesn't log it (unless the admin set up extra logging, which our default
-  setup does not)
-
-You can leave at any time with `/leave YES`. The peer is gone, your chat_id
-binding is gone, you're done.
+Your WireGuard private key lives only inside the config on your device. The
+server sees your traffic in transit (as any VPN or ISP would) but the
+default setup keeps no browsing logs. Ask your admin if you want specifics
+about their setup.
 
 ## Troubleshooting
 
-**"No such invite, or it expired/was burned."**
-The token's 30-minute window passed, or someone else used it first. Ask
-your admin for a fresh `/invite alice`.
+**The WireGuard app shows red / no traffic.**
+- Make sure the toggle is actually ON.
+- Make sure you have wifi or mobile data.
+- If the server was recently rebuilt, your config may be stale — ask your
+  admin for a fresh one.
 
-**"This is a private VPN bot."**
-You sent something other than `/claim TOKEN` and you're not claimed yet.
-The bot ignores you. Send the claim command.
+**It connects but websites don't load.**
+Toggle the tunnel off and on. If it still fails, tell your admin — the
+server may be rebooting.
 
-**The bot doesn't respond at all.**
-Make sure you pressed "Start" in the chat first. If still nothing, the
-bot is offline — tell the admin.
-
-**My VPN was working, suddenly it's not.**
-Try reconnecting in the WireGuard app first. If that doesn't help, ask
-your admin to check `/status`. The server might be down or rebooting.
-
-**I scanned the QR but the WireGuard app shows red / no traffic.**
-- Make sure the WireGuard toggle is actually ON
-- Check that you have data/wifi
-- The server's static IP is in the config — if the server was rebuilt
-  recently, your config might be stale. Ask admin for `/reissue`.
+**I can't import the QR / file.**
+Make sure you installed the official WireGuard app (not a lookalike). The
+QR must be scanned from *within* the WireGuard app's "add tunnel" screen,
+not your camera app.
 
 ## That's all
 
-This is intentionally a small surface. You scan a QR, you have a VPN.
-Everything else is the admin's problem.
+You scan a code, you have a VPN. Everything else is the admin's job.

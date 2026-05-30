@@ -230,19 +230,21 @@ recent handshake.
 
 You're done.
 
-## Inviting other peers later
+## Adding other peers later
 
 ```
-/add alice                 (bot DMs you alice's config; if she's nearby
-                            you can scan her phone with the QR directly)
-
-/invite alice              (bot gives you a token; send to Alice via any
-                            channel; she opens the bot in Telegram and
-                            runs /claim, then the bot DMs her the config)
+/add alice
 ```
 
-The claim flow is preferred when Alice is remote — no config files need
-to traverse insecure channels.
+The bot DMs you `alice.conf` plus a QR code. Get it to Alice however suits
+you: scan the QR directly from her phone if she's with you, or send the
+file/QR over WhatsApp, Signal, email, AirDrop — any channel. Alice imports
+it into the WireGuard app. She never needs Telegram or any account.
+
+If you're sending a config over a channel you don't fully trust, prefer the
+QR image (it's awkward to misuse from a screenshot scattered in a chat) or
+delete the message after she's imported it. The config contains her private
+key, so treat it like a password in transit.
 
 ## What if something went wrong
 

@@ -1,7 +1,8 @@
 #!/opt/homebrew/bin/bash
-#    !/usr/bin/env bash
-# edit install.sh shebang to /opt/homebrew/bin/bash if needed
-
+#      !/usr/bin/env bash
+#      
+#
+#
 # wg-vpn-bot installer (v0.2)
 # Creates a fresh GCP project + VM running WireGuard, managed via a Telegram bot.
 # Designed for the GCP free tier (us-* regions). Single-admin, IAP-protected SSH.
@@ -15,7 +16,7 @@ set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
 # ---------- constants ----------
-SCRIPT_VERSION="0.2.9"
+SCRIPT_VERSION="0.2.10"
 FREE_TIER_REGIONS=("us-west1" "us-central1" "us-east1")
 DEFAULT_REGION="us-central1"
 DEFAULT_ZONE_SUFFIX="-a"

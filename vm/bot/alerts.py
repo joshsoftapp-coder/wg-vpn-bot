@@ -50,12 +50,29 @@ class AlertSink:
 
 
 def ensure_fifo() -> None:
+    """Ensure the FIFO exists. Normally created by tmpfiles.d at boot.
+
+    The bot runs as wgbot, which cannot mkfifo in /run (root-owned, 0755).
+    On the normal path tmpfiles.d has already created /run/wg-bot.fifo with
+    the right owner/mode before the bot starts, so this returns early. The
+    mkfifo fallback only succeeds if we happen to have write access; if it
+    raises, we log and let the caller decide — losing watcher alerts is bad
+    but must not take down the whole bot.
+    """
     if FIFO_PATH.exists():
         if stat.S_ISFIFO(FIFO_PATH.stat().st_mode):
             return
         FIFO_PATH.unlink()
-    os.mkfifo(FIFO_PATH, 0o622)
-    os.chmod(FIFO_PATH, 0o622)
+    try:
+        os.mkfifo(FIFO_PATH, 0o622)
+        os.chmod(FIFO_PATH, 0o622)
+    except PermissionError:
+        log.error(
+            "FIFO %s missing and cannot be created by this user; "
+            "watcher alerts will not be delivered. Check tmpfiles.d.",
+            FIFO_PATH,
+        )
+        raise
 
 
 async def listen_fifo(sink: AlertSink) -> None:
@@ -73,7 +90,12 @@ async def listen_fifo(sink: AlertSink) -> None:
                         line, buf = buf.split(b"\n", 1)
                         await _dispatch(sink, line.decode("utf-8", "replace").strip())
                 else:
+                    # EOF: all writers closed their end. Reopen to re-arm.
+                    # Close first and mark fd invalid so a failure in the
+                    # subsequent open() can't leave the finally block trying
+                    # to close a stale (possibly reused) descriptor.
                     os.close(fd)
+                    fd = -1
                     await asyncio.sleep(0.5)
                     fd = os.open(FIFO_PATH, os.O_RDONLY | os.O_NONBLOCK)
             except BlockingIOError:
@@ -82,10 +104,11 @@ async def listen_fifo(sink: AlertSink) -> None:
                 log.error("FIFO read error: %s", e)
                 await asyncio.sleep(1.0)
     finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 async def _dispatch(sink: AlertSink, line: str) -> None:

@@ -538,6 +538,7 @@ async def cmd_shutdown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @admin_only
+@admin_only
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args or ctx.args[0].lower() != "wg":
         await update.effective_message.reply_text("Usage: /restart wg")

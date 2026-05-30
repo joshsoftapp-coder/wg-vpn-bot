@@ -365,9 +365,13 @@ def remove(name: str) -> Peer:
         "sudo", "/usr/bin/wg", "set", WG_IFACE,
         "peer", p.public_key, "remove",
     ])
-    _save_runtime()
-    # Drop the name from state.json (the authoritative mapping).
+    # Drop the name from state.json (the authoritative mapping) BEFORE the
+    # save, mirroring add()'s state-first ordering. If the process dies
+    # between the kernel remove and here, list_peers() still won't surface
+    # the peer (it's gone from the kernel) — but we avoid leaving a stale
+    # pubkey->name entry that would otherwise persist forever.
     _drop_name(p.public_key)
+    _save_runtime()
     # Best-effort cleanup of any leftover '# name:' comment in conf (though
     # wg-quick save already stripped all comments).
     _strip_orphan_name_comments()

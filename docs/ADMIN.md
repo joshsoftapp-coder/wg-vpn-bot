@@ -21,18 +21,11 @@ you'll notice the next time you try to use the VPN.
 
 | Command | What it does |
 |---|---|
-| `/peers` | List all peers. ✉ marks claimed ones. |
-| `/peer alice` | Detail: IP, public key, claim status, transfer stats. |
+| `/peers` | List all peers with their IP and last handshake. |
+| `/peer alice` | Detail: IP, public key, transfer stats. |
 | `/add alice` | Create a peer. DMs you the .conf + QR. |
-| `/reissue alice` | New keypair for an existing peer. Same name and IP. DMs to peer if claimed, else to you. |
-| `/remove alice YES` | Permanently delete peer. Also clears claim. |
-
-### Peer claims (Telegram binding)
-
-| Command | What it does |
-|---|---|
-| `/invite alice` | Generate a 30-min claim token. Forward to Alice via any channel. |
-| `/unclaim alice` | Clear Alice's chat_id binding. Her VPN still works; bot stops being able to DM her. |
+| `/reissue alice` | New keypair for an existing peer. Same name and IP. DMs the new config to you. |
+| `/remove alice YES` | Permanently delete the peer. Its config stops working. |
 
 ### VM management
 
@@ -40,7 +33,7 @@ you'll notice the next time you try to use the VPN.
 |---|---|
 | `/status` | Uptime, load, mem, disk, WG state, public IP, peer count. |
 | `/logs wg \| ssh \| bot [n]` | Tail journald. Default 30 lines, max 200. |
-| `/reboot YES` | Reboot the VM. Claimed peers get a "rebooting ~60s" message first. |
+| `/reboot YES` | Reboot the VM. Peers reconnect automatically when it's back (~60s). |
 | `/shutdown YES` | Power off. Bot becomes unreachable; restart VM from GCP Console. |
 | `/restart wg` | Restart `wg-quick@wg0` only. |
 | `/update` | Dry-run: show which packages would upgrade. |
@@ -55,65 +48,51 @@ you'll notice the next time you try to use the VPN.
 | `/whoami` | Confirms your admin status and shows your user_id. |
 | `/help` | Command list. |
 
-## The three "destruction" commands and how they differ
+## `/reissue` vs `/remove`
 
-This trips people up, so worth being explicit:
+| | What happens to keys | Does the old config still work? |
+|---|---|---|
+| `/reissue alice` | New keypair, same name and IP | **No** — old config is dead, send the new one |
+| `/remove alice YES` | Peer deleted entirely | **No** — peer is gone |
 
-| | Touches WG peer? | Touches claim binding? | Alice's config still works? | Bot can still DM Alice? |
-|---|---|---|---|---|
-| `/reissue alice` | **Yes** — new keys, same IP | No | **No** — old config dead | Yes |
-| `/unclaim alice` | No | **Yes** — cleared | Yes — VPN unchanged | No |
-| `/remove alice YES` | **Yes** — deleted | **Yes** — cleared | No — peer gone | No |
+- **reissue** = same person, new credentials (lost device, suspected key leak)
+- **remove** = that peer is gone for good
 
-Mnemonic:
-- **reissue** = new VPN keys
-- **unclaim** = new Telegram binding (or none)
-- **remove** = everything goes
+After either command the bot DMs *you* the result; you forward the new
+config to the peer through whatever channel you use with them.
 
 ## Common scenarios
 
 ### "I want to add a friend"
 
-If they're with you: `/add bob`, forward the QR via AirDrop / WhatsApp / however.
-
-If they're remote and you want zero forwarding:
 ```
-/add bob          (you receive the config, ignore it)
-/invite bob       (you receive a token line)
-                  forward the token line to Bob
-                  Bob claims, bot DMs him the config
+/add bob
 ```
+The bot DMs you `bob.conf` plus a QR. Forward it to Bob however you like —
+AirDrop, WhatsApp, Signal, email, or show him the QR to scan in person.
+Bob imports it into the WireGuard app. He never touches Telegram.
 
 ### "Bob lost his phone"
 
-If Bob is claimed:
 ```
-/reissue bob      (new config DM'd directly to Bob)
+/reissue bob      (new config DM'd to you; forward it to Bob)
 ```
+Bob's old config is now dead, so a finder of the lost phone can't use it.
 
-If Bob is not claimed:
-```
-/reissue bob      (new config DM'd to you, then you forward)
-```
-
-### "Bob got a new Telegram account"
+### "Bob doesn't need the VPN anymore"
 
 ```
-/unclaim bob               (clear the old binding)
-/invite bob                (fresh token)
-                           Bob claims from the new account
-                           Bot DMs new config to new account
-                           (no /reissue needed — peer keys unchanged)
+/remove bob YES
 ```
+Peer deleted, his config stops working.
 
-### "Bob's Telegram and phone are both compromised"
+### "Bob's device was stolen and I want his access killed now"
 
-Treat the WG keys and the claim binding as both compromised:
 ```
-/remove bob YES            (clear everything)
-/add bob                   (fresh keys, fresh peer)
-/invite bob                (fresh token; send via a channel you trust)
+/remove bob YES   (kills it immediately)
 ```
+Then, if Bob wants access on a replacement device later, `/add bob` for a
+fresh config.
 
 ### "I want to go on vacation and not pay for an unused IP"
 
@@ -150,11 +129,10 @@ Per the design: the VM is disposable.
 
 There's no in-place migration. The path is:
 ```
-/export                    download current wg0.conf (for reference)
 ./uninstall.sh OLD_PROJECT_ID
 ./install.sh               choose the new region
                            /add each peer fresh
-                           /invite each peer
+                           send each peer their new config
 ```
 
 You can't restore the old peers with old configs — server identity changes,
@@ -187,7 +165,6 @@ preserved).
 ### Batched (every 5 min, max 1 per batch)
 
 - 🟧 **Disk ≥ 85% full**
-- 📥 **Peer claimed** — when someone successfully runs `/claim`
 
 ### In the daily VM digest
 
@@ -198,14 +175,13 @@ preserved).
 ### In the daily WG digest
 
 - Public IP
-- Total/claimed peer counts
+- Total peer count
 - Active peers in last 24h with transfer totals
 
 ## Audit log
 
 Everything is logged to `/var/log/wg-admin-bot/audit.log`:
 - Every command you run (admin)
-- Every claim attempt (success or fail)
 - Every peer add/remove/reissue
 - Every unauthorized DM attempt
 - Pairing events
@@ -242,14 +218,47 @@ sudo wg-bot-reset-admin
 
 This:
 1. Clears the stored admin user_id
-2. Clears all peer claim bindings (peers will re-claim)
-3. Generates a new pairing token (30-min TTL)
-4. Restarts the bot
+2. Generates a new pairing token (30-min TTL)
+3. Restarts the bot
 
 Send `/start NEW-TOKEN` from your new Telegram account.
 
-**Note:** all peers need to re-claim after admin reset. Their VPN configs
-keep working — only the Telegram bindings are cleared.
+**Note:** peers are unaffected by an admin reset. Their VPN configs keep
+working throughout — this only changes who controls the bot.
+
+## Recovering from a suspected VM compromise
+
+If you think the VM itself is compromised — not just your Telegram account —
+the recommended path is to **purge and rebuild**:
+
+```bash
+./uninstall.sh PROJECT_ID    # deletes the entire GCP project (soft-delete; 30d to undelete)
+./install.sh                 # makes a new project, new VM, new server keys
+                             # /add each peer fresh
+                             # send each peer their new config
+```
+
+This is fine to do casually. The VM has nothing on it that would be worth
+recovering from the attacker's perspective:
+
+- The WireGuard server private key — irrelevant once you've issued new
+  configs from the new server.
+- Peer public keys and the human names you chose (`johna`, `vpn-a3f9`,
+  etc.). At most mildly embarrassing.
+- The Telegram bot token — rotate it via @BotFather if you're cautious;
+  otherwise it just goes idle once the old VM is gone.
+- An audit log of which Telegram users DM'd the bot.
+
+There is **no user data, no browsing history, no stored credentials** on
+this server. It's a stateless WireGuard endpoint with a small management
+bot. Rebuilding is ~10 minutes; the only inconvenience to peers is
+importing the new config you send them.
+
+Whenever you're uncertain, run `sudo wg-bot-doctor --verbose` first — it
+audits every file, service, and runtime invariant the bot depends on, and
+will surface most classes of compromise or misconfiguration without
+guessing. If the doctor reports green and you still feel uneasy, purge
+and rebuild — that path is what the project is built around.
 
 ## Diagnosing problems with wg-bot-doctor
 
@@ -268,7 +277,7 @@ report of what's wrong. Four sections:
 
 - **sys** — file ownership/modes, FIFO, tmpfiles rule, sudoers, systemd units
 - **bot** — service state, crash history, log analysis, Telegram reachability, config integrity
-- **wg** — kernel-vs-config peer consistency, IP allocation conflicts, claim mappings, handshake freshness
+- **wg** — kernel-vs-config peer consistency, IP allocation conflicts, peer-name mapping, handshake freshness
 - **net** — IP forwarding, NAT masquerade rules, outbound interface, FORWARD chain
 
 Common flags:
