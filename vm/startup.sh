@@ -1,5 +1,6 @@
 #!/bin/bash
-# VM bootstrap. Runs once at first boot via GCP startup script.
+# VM bootstrap. GCP runs this on EVERY VM start (not just first boot).
+# First-boot-only sections are guarded with explicit checks.
 
 set -euo pipefail
 exec > >(tee -a /var/log/wg-vpn-bot-startup.log) 2>&1
@@ -50,24 +51,61 @@ install -d -o wgbot -g wgbot -m 0750 /var/log/wg-admin-bot
 install -d -o root  -g wgbot -m 0750 /etc/wg-admin-bot
 
 # ---------- bot code ----------
-install -d -o root -g root -m 0755 /opt/wg-admin-bot
-cp -r "$BUNDLE/bot/." /opt/wg-admin-bot/
-chown -R root:root /opt/wg-admin-bot
-chmod -R 0755 /opt/wg-admin-bot
+# Only copy and pip-install on first boot. On reboot the installed code is
+# already in place; re-copying is harmless but pip install takes ~30s.
+if [[ ! -d /opt/wg-admin-bot/venv ]]; then
+  install -d -o root -g root -m 0755 /opt/wg-admin-bot
+  cp -r "$BUNDLE/bot/." /opt/wg-admin-bot/
+  chown -R root:root /opt/wg-admin-bot
+  chmod -R 0755 /opt/wg-admin-bot
+
+  # ---------- python venv ----------
+  python3 -m venv /opt/wg-admin-bot/venv
+  /opt/wg-admin-bot/venv/bin/pip install --quiet --no-cache-dir \
+    -r /opt/wg-admin-bot/requirements.txt
+  echo "[$(date)] first boot: installed bot code and python venv"
+else
+  echo "[$(date)] subsequent boot: bot code already installed, skipping"
+fi
 
 # ---------- config & state ----------
-cp "$BUNDLE/config.yaml" /etc/wg-admin-bot/config.yaml
-chown root:wgbot /etc/wg-admin-bot/config.yaml
-# 0660 (not 0640) — the bot writes to config.yaml during TOFU pairing
-# (config.set_admin_id) and on pairing-token refresh. Read-only-for-group
-# would block these writes.
-chmod 0660 /etc/wg-admin-bot/config.yaml
+# CRITICAL: guard these with a first-boot check.
+# GCP runs this startup script on EVERY VM start (not just first boot).
+# Without the guard, every reboot overwrites config.yaml (wiping the
+# paired admin_user_id) and state.json (wiping peer names).
+# Sentinel: if config.yaml already exists with a non-null admin.user_id,
+# the VM has been through pairing — skip both copies.
+_CONFIG_TARGET=/etc/wg-admin-bot/config.yaml
+if [[ ! -f "$_CONFIG_TARGET" ]] || \
+   python3 -c "
+import yaml, sys
+cfg = yaml.safe_load(open('$_CONFIG_TARGET'))
+sys.exit(0 if cfg.get('admin',{}).get('user_id') is None else 1)
+" 2>/dev/null; then
+  # First boot (or config absent / not yet paired): safe to copy template.
+  cp "$BUNDLE/config.yaml" "$_CONFIG_TARGET"
+  chown root:wgbot "$_CONFIG_TARGET"
+  chmod 0660 "$_CONFIG_TARGET"
 
-install -o wgbot -g wgbot -m 0600 /dev/null /var/lib/wg-admin-bot/state.json
-echo '{}' > /var/lib/wg-admin-bot/state.json
-chown wgbot:wgbot /var/lib/wg-admin-bot/state.json
+  # state.json: also only initialise on first boot.
+  # On subsequent boots, state.json holds peer_names and other runtime data
+  # we must not wipe.
+  install -o wgbot -g wgbot -m 0600 /dev/null /var/lib/wg-admin-bot/state.json
+  echo '{}' > /var/lib/wg-admin-bot/state.json
+  chown wgbot:wgbot /var/lib/wg-admin-bot/state.json
+  echo "[$(date)] first boot: initialised config.yaml and state.json"
+else
+  # Subsequent boot: preserve existing config (has live admin_user_id etc.)
+  # but re-apply ownership/mode in case a previous bad write changed them.
+  chown root:wgbot "$_CONFIG_TARGET"
+  chmod 0660 "$_CONFIG_TARGET"
+  echo "[$(date)] subsequent boot: preserved existing config.yaml and state.json"
+fi
 
-install -o wgbot -g wgbot -m 0640 /dev/null /var/log/wg-admin-bot/audit.log
+# audit.log: create only if absent. `install /dev/null` truncates, so this
+# MUST be guarded — without the guard every reboot wipes the audit trail.
+[[ -f /var/log/wg-admin-bot/audit.log ]] || \
+  install -o wgbot -g wgbot -m 0640 /dev/null /var/log/wg-admin-bot/audit.log
 
 # ---------- helper script ----------
 install -m 0755 "$BUNDLE/wg-helpers/reset-admin.sh" /usr/local/sbin/wg-bot-reset-admin
@@ -76,11 +114,6 @@ install -m 0755 "$BUNDLE/wg-helpers/wg-bot-doctor" /usr/local/sbin/wg-bot-doctor
 # ---------- sudoers (install EARLY, before any sudo calls) ----------
 install -m 0440 -o root -g root "$BUNDLE/sudoers.d/wgbot" /etc/sudoers.d/wgbot
 visudo -c -f /etc/sudoers.d/wgbot || { echo "FATAL: bad sudoers"; rm /etc/sudoers.d/wgbot; exit 1; }
-
-# ---------- python venv ----------
-python3 -m venv /opt/wg-admin-bot/venv
-/opt/wg-admin-bot/venv/bin/pip install --quiet --no-cache-dir \
-  -r /opt/wg-admin-bot/requirements.txt
 
 # ---------- wg server config ----------
 # CRITICAL: set the directory mode BEFORE creating wg0.conf inside it.
@@ -168,7 +201,39 @@ fi
 # Use the bot's CLI to create the first peer the same way subsequent peers
 # will be created. Run as wgbot. A failure here is fatal — the installer's
 # pairing flow depends on the stashed first-peer secret.
-if ! grep -q "^# name: ${FIRST_PEER}$" /etc/wireguard/wg0.conf 2>/dev/null; then
+#
+# Detection MUST consult the authoritative name map in state.json, NOT a
+# '# name:' comment in wg0.conf. wg-quick save strips all comments on every
+# call, so the comment never survives past the first peer op — checking for
+# it would make this block run on EVERY boot, and add() would then raise
+# "already exists", tripping the FATAL branch on every reboot.
+#
+# We also treat "the kernel already has at least one peer" as "first peer
+# done". This covers the rare case where state.json was lost but the WG
+# interface still carries the original peer: re-running add() there would
+# mint a duplicate peer (new key/IP) and orphan the original. If you truly
+# want a fresh first peer after total state loss, uninstall + reinstall.
+_STATE_TARGET=/var/lib/wg-admin-bot/state.json
+_first_peer_present() {
+  # 0 (true) if the first peer is already accounted for.
+  sudo -u wgbot python3 -c "
+import json, sys
+try:
+    s = json.load(open('$_STATE_TARGET'))
+except (OSError, ValueError):
+    s = {}
+names = (s.get('peer_names') or {}).values()
+if '${FIRST_PEER}' in names:
+    sys.exit(0)
+sys.exit(1)
+" 2>/dev/null && return 0
+  # state.json didn't confirm it; fall back to kernel membership.
+  local n
+  n=$(/usr/bin/wg show wg0 peers 2>/dev/null | grep -c .)
+  [[ "${n:-0}" -ge 1 ]]
+}
+
+if ! _first_peer_present; then
   echo "[$(date)] creating first peer: $FIRST_PEER"
   if ! sudo -u wgbot /opt/wg-admin-bot/venv/bin/python3 \
        /opt/wg-admin-bot/cli.py add-peer "$FIRST_PEER"; then
@@ -179,6 +244,8 @@ if ! grep -q "^# name: ${FIRST_PEER}$" /etc/wireguard/wg0.conf 2>/dev/null; then
       "import wg_cmds; print(wg_cmds.list_peers())" 2>&1 || true
     exit 1
   fi
+else
+  echo "[$(date)] first peer already present, skipping"
 fi
 
 # ---------- systemd units ----------
