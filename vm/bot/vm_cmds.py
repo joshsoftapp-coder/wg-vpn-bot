@@ -1,6 +1,7 @@
 """VM/host operations: status, reboot, shutdown, update, restart."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -93,12 +94,17 @@ def shutdown() -> None:
 
 
 def apt_dry_run() -> str:
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
     try:
-        subprocess.check_call(["sudo", "/usr/bin/apt-get", "update"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_call(
+            ["sudo", "/usr/bin/apt-get", "update"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
         out = subprocess.check_output(
             ["sudo", "/usr/bin/apt-get", "-y", "-s", "upgrade"],
             text=True, stderr=subprocess.STDOUT,
+            env=env,
         )
         pkgs = [ln.split()[1] for ln in out.splitlines() if ln.startswith("Inst ")]
         if not pkgs:
@@ -109,12 +115,22 @@ def apt_dry_run() -> str:
 
 
 def apt_apply() -> str:
+    # DEBIAN_FRONTEND=noninteractive prevents dpkg maintainer scripts from
+    # prompting or failing when run without a TTY. --force-confold keeps the
+    # existing config file on conflict rather than hanging for user input.
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
     try:
-        subprocess.check_call(["sudo", "/usr/bin/apt-get", "update"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_call(
+            ["sudo", "/usr/bin/apt-get", "update"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
         out = subprocess.check_output(
-            ["sudo", "/usr/bin/apt-get", "-y", "upgrade"],
+            ["sudo", "/usr/bin/apt-get", "-y",
+             "-o", "Dpkg::Options::=--force-confold",
+             "upgrade"],
             text=True, stderr=subprocess.STDOUT,
+            env=env,
         )
         pkgs = [ln.split()[1] for ln in out.splitlines() if ln.startswith("Setting up ")]
         return f"Upgrade complete. {len(pkgs)} packages touched."
