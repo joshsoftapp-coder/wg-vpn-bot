@@ -16,7 +16,7 @@ set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
 # ---------- constants ----------
-SCRIPT_VERSION="0.2.10"
+SCRIPT_VERSION="0.2.11"
 FREE_TIER_REGIONS=("us-west1" "us-central1" "us-east1")
 DEFAULT_REGION="us-central1"
 DEFAULT_ZONE_SUFFIX="-a"

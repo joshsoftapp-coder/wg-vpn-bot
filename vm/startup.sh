@@ -20,6 +20,16 @@ apt-get install -y -qq \
   qrencode iptables jq \
   unattended-upgrades
 
+# ---------- remove unused base-image packages ----------
+# exim4 is a mail daemon shipped with Debian that serves no purpose here.
+# Remove it to eliminate upgrade noise and the class of dpkg-script failure
+# that can occur when apt runs non-interactively without DEBIAN_FRONTEND set.
+# bsd-mailx depends on exim4 and is equally unused. || true: if a future
+# Debian image ships without these, the purge exits non-zero — don't abort.
+apt-get purge -y -qq \
+  exim4 exim4-base exim4-config exim4-daemon-light bsd-mailx || true
+apt-get autoremove -y -qq || true
+
 # ---------- ip forwarding ----------
 cat > /etc/sysctl.d/99-wg-forward.conf <<EOF
 net.ipv4.ip_forward = 1
