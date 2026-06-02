@@ -1,50 +1,61 @@
 # wg-vpn-bot
 
-Self-hosted WireGuard VPN on Google Cloud, managed entirely from a Telegram bot. One installer script, fits in the GCP free tier, no web UI.
+Self-hosted WireGuard VPN on Google Cloud, managed from a Telegram bot.
+One installer script. Fits the GCP free tier. No web UI.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR/wg-vpn-bot.git
+git clone https://github.com/joshsoftapp-coder/wg-vpn-bot
 cd wg-vpn-bot
 ./install.sh
 ```
 
-About 10 minutes later, you'll have a VPN.
-
-> ⚠️ Before you run the installer, **please read [DISCLAIMER.md](DISCLAIMER.md)**. Short version: this is a hobby tool, GCP can bill you if you exceed the free tier. If you understand that, carry on.
-
-## Documentation
-
-- [**DISCLAIMER.md**](DISCLAIMER.md) — what this is and what it isn't (read first)
-- **SETUP.md** — first-time installation walkthrough
-- **USER.md** — for peers (people who will use the VPN)
-- **ADMIN.md** — day-to-day operating guide
-- **SPEC.md** — architecture, design rationale, threat model
-- [**SECURITY.md**](SECURITY.md) — how to report a security issue
+~10 minutes later you have a running VPN.
 
 ## What you get
 
-- One e2-micro VM running Debian 12 with WireGuard
-- A Telegram bot for admin: `/add johna`, `/reboot YES`, `/status`, `/digest`, …
-- `wg-bot-doctor` — read-only audit tool that diagnoses most failure modes
+- GCP e2-micro VM (Debian 12) running kernel WireGuard
+- Telegram bot to manage peers, reboot, update, and monitor — from your phone
 - SSH closed to the internet (Google IAP only)
-- Static IP, daily digests, audit log
-- Admin uses Telegram. Peers don't — they just receive a `.conf` file through whatever channel you already use with them.
+- Static IP, daily digests, audit log, diagnostic tool (`wg-bot-doctor`)
+
+## Cost
+
+Free tier covers one e2-micro in `us-west1`, `us-central1`, or `us-east1`,
+30 GB disk, and 1 GB outbound traffic per month. Beyond that:
+
+- Outbound over 1 GB/month: ~$0.12/GB
+- Non-US region: not free
+- Static IP while VM is stopped: ~$7/month
+
+Run `./uninstall.sh` when not in use (soft-deletes the project, 30-day
+recovery window, $0 while deleted).
 
 ## Requirements
 
-- Linux or macOS laptop (bash 4+)
-- A Google account with billing set up (free tier cover only light usage)
-- Telegram on your phone (for the admin only)
-- \~10 minutes
+- macOS or Linux, bash 4+, `gcloud`, `jq`, `curl`
+- Google account with a billing account set up
+- Telegram (admin only — peers don't need it)
+
+## Limitations
+
+- Not for production or paying customers
+- Not tested beyond ~10 peers
+- Admin commands transit Telegram's servers — not suitable for
+  privacy-critical management traffic
+
+## Disposable by design
+
+If anything breaks or you don't trust the state:
+
+```bash
+./uninstall.sh PROJECT_ID
+./install.sh
+```
+
+Fresh project, fresh keys. ~10 minutes.
 
 ## License
 
-[MIT](LICENSE).
-
-## Not for
-
-- Production use serving paying customers
-- Privacy-critical use cases (admin commands pass through Telegram's servers)
-- More than \~10 peers (e2-micro is small)
+[MIT](LICENSE)
