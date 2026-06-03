@@ -51,11 +51,14 @@ re-pair the bot, and read the server config. Mitigate in advance: enable
 Google two-factor authentication. To recover a compromised account:
 [g.co/account-recovery](https://g.co/account-recovery)
 
-**Compromised VM** — the bot token and WireGuard server key are on the VM
-in plaintext. What an attacker gets: the server identity, the bot token,
-and the peer name list. What they do not get: peer private keys (never
-stored on the server), browsing history, or credentials. Recovery is a
-full rebuild — you lose nothing except having to re-add peers:
+**Compromised VM** — this is close to a non-event. The VM holds no personal
+data, no browsing history, and no credentials; the only things at stake are
+the peer name list and a brief service interruption while you rebuild. The
+bot token and WireGuard server key are on the VM in plaintext. What an
+attacker gets: the server identity, the bot token, and the peer name list.
+What they do not get: peer private keys (never stored on the server),
+browsing history, or credentials. Recovery is a full rebuild — you lose
+nothing except having to re-add peers:
 
 ```bash
 ./uninstall.sh PROJECT_ID

@@ -435,16 +435,29 @@ create_firewall() {
 
   # Verify no rule other than ours permits tcp:22. If anything still allows
   # 22 from a non-IAP range, fail loudly rather than ship an open VM.
-  local open22
-  open22=$(gcloud compute firewall-rules list \
+  #
+  # Note: this check must never abort the script by itself. Under `set -e` a
+  # command substitution that exits non-zero would kill us silently. We list
+  # ALL port-22 rules (a simple, reliable filter) and inspect their source
+  # ranges in the shell, appending '|| true' so a gcloud hiccup can't abort.
+  local rules22 bad22=""
+  rules22=$(gcloud compute firewall-rules list \
     --project="$PROJECT_ID" \
-    --filter="allowed.ports=22 AND sourceRanges!=$IAP_SSH_RANGE" \
-    --format="value(name)" 2>/dev/null)
-  if [[ -n "$open22" ]]; then
-    err "Firewall verification FAILED: these rules still allow port 22 from"
-    err "outside the IAP range: $open22"
-    err "Delete them before relying on this VM:"
-    err "  gcloud compute firewall-rules delete <name> --project=$PROJECT_ID"
+    --filter="allowed.ports~22" \
+    --format="csv[no-heading](name,sourceRanges.list())" 2>/dev/null || true)
+  if [[ -n "$rules22" ]]; then
+    while IFS=, read -r rname rsrc; do
+      [[ -z "$rname" ]] && continue
+      # Anything whose source is not exactly the IAP range is a problem.
+      if [[ "$rsrc" != "$IAP_SSH_RANGE" ]]; then
+        bad22+="${rname} (${rsrc}) "
+      fi
+    done <<< "$rules22"
+  fi
+  if [[ -n "$bad22" ]]; then
+    err "Firewall verification FAILED — these rules allow tcp:22 from outside"
+    err "the IAP range: $bad22"
+    err "Delete them:  gcloud compute firewall-rules delete <name> --project=$PROJECT_ID"
     exit 1
   fi
 
