@@ -116,8 +116,11 @@ def apt_dry_run() -> str:
 
 def apt_apply() -> str:
     # DEBIAN_FRONTEND=noninteractive prevents dpkg maintainer scripts from
-    # prompting or failing when run without a TTY. --force-confold keeps the
-    # existing config file on conflict rather than hanging for user input.
+    # prompting when run without a TTY. The conffile-conflict policy
+    # (--force-confold equivalent) is set on disk in /etc/apt/apt.conf.d via
+    # startup.sh, so the command here stays a plain 'apt-get -y upgrade' and
+    # the sudoers rule that authorises it can match exactly (no '=' in the
+    # command spec, which sudoers cannot parse).
     env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
     try:
         subprocess.check_call(
@@ -126,9 +129,7 @@ def apt_apply() -> str:
             env=env,
         )
         out = subprocess.check_output(
-            ["sudo", "/usr/bin/apt-get", "-y",
-             "-o", "Dpkg::Options::=--force-confold",
-             "upgrade"],
+            ["sudo", "/usr/bin/apt-get", "-y", "upgrade"],
             text=True, stderr=subprocess.STDOUT,
             env=env,
         )

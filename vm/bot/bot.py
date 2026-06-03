@@ -37,13 +37,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# PTB logs every HTTP request at INFO, and the URL embeds the bot token
-# (https://api.telegram.org/bot<TOKEN>/getUpdates). At INFO that writes the
-# token into the systemd journal on every poll. Raise these loggers to
-# WARNING so the token never lands in logs; real errors still surface.
+# The token leaks via httpx's request log line, which prints the full URL
+# (https://api.telegram.org/bot<TOKEN>/getUpdates) at INFO on every poll.
+# Silence httpx/httpcore so the token never lands in the journal. We do NOT
+# silence the 'telegram' logger — it emits the "Application started" line at
+# INFO that the installer's readiness check relies on, and it does not log
+# the token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
 
 
 # =========== send helpers ===========

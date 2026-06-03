@@ -50,6 +50,18 @@ Unattended-Upgrade::Automatic-Reboot "false";
 EOF
 systemctl enable --now unattended-upgrades
 
+# ---------- apt conffile policy ----------
+# Keep the existing config file on conflict, never prompt. This makes any
+# non-interactive apt run (the bot's /update YES, unattended-upgrades) safe
+# without passing -o Dpkg::Options::= on the command line — which can't be
+# expressed in a sudoers command spec (the '=' breaks sudoers parsing).
+cat > /etc/apt/apt.conf.d/90wg-bot-noninteractive <<'EOF'
+Dpkg::Options {
+    "--force-confdef";
+    "--force-confold";
+}
+EOF
+
 # ---------- wgbot system user ----------
 if ! id wgbot &>/dev/null; then
   useradd --system --home /var/lib/wg-admin-bot --create-home \

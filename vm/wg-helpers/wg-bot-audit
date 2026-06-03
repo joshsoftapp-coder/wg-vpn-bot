@@ -100,13 +100,24 @@ else
 fi
 
 # 5. Listening sockets
-tcp_listen=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u | tr '\n' ' ')
-INFO "TCP listening ports: ${tcp_listen:-none}"
-unexpected_tcp=$(echo "$tcp_listen" | tr ' ' '\n' | grep -vE '^(22)?$' || true)
+# Only listeners on a ROUTABLE address matter — a service bound to loopback
+# (127.x / ::1 / %lo) cannot be reached off-box. Of the routable listeners we
+# accept ssh:22 and 5355 (systemd-resolved LLMNR, shipped by Debian). 5355 is
+# blocked by the GCP firewall (only 22 and the WG UDP port are permitted
+# inbound), and we deliberately leave the host's default services untouched,
+# so it is a known-benign bind rather than an exposure. Anything else routable
+# is flagged.
+routable_tcp=$(ss -tlnH 2>/dev/null | awk '{print $4}' \
+  | grep -vE '^(127\.|\[::1\]|.*%lo)' \
+  | sed -E 's/.*:([0-9]+)$/\1/' \
+  | sort -u | tr '\n' ' ')
+INFO "Routable TCP listeners: ${routable_tcp:-none}"
+# Allowed routable ports: 22 (ssh), 5355 (systemd-resolved LLMNR, fw-blocked).
+unexpected_tcp=$(echo "$routable_tcp" | tr ' ' '\n' | grep -vE '^(22|5355)?$' || true)
 if [[ -z "$unexpected_tcp" ]]; then
-  PASS listen-tcp "No unexpected TCP listeners (only sshd:22)."
+  PASS listen-tcp "No unexpected routable TCP listeners (ssh:22, resolved:5355)."
 else
-  FAIL listen-tcp "Unexpected TCP listeners: $(echo "$unexpected_tcp" | tr '\n' ' ')"
+  FAIL listen-tcp "Unexpected routable TCP listeners: $(echo "$unexpected_tcp" | tr '\n' ' ')"
 fi
 if ss -tlnp 2>/dev/null | grep -q 'python3'; then
   FAIL bot-no-listen "Bot is listening on a TCP socket (should be outbound-only)."
@@ -125,6 +136,40 @@ if echo "$sshd_eff" | grep -qiE '^permitrootlogin (no|prohibit-password)'; then
   PASS ssh-rootlogin "SSH root login restricted."
 else
   WARN "PermitRootLogin permissive: $(echo "$sshd_eff" | grep -i permitrootlogin)"
+fi
+
+# 6b. SSH source IPs — every SSH connection MUST originate from the IAP
+# range (35.235.240.0/20 = 35.235.240.0 .. 35.235.255.255). The firewall is
+# supposed to permit tcp:22 only from that range, so a source IP in the sshd
+# log from anywhere else means the firewall is leaking (e.g. a stray
+# default-allow-ssh rule) — the same symptom as internet brute-force noise.
+# This verifies the firewall control from inside the host.
+_ip_in_iap() {
+  # Returns 0 if $1 is within 35.235.240.0/20, else 1.
+  local ip="$1" a b c
+  IFS=. read -r a b c _ <<< "$ip" || return 1
+  [[ "$a" == "35" && "$b" == "235" ]] || return 1
+  # third octet 240..255 covers the /20
+  [[ "$c" =~ ^[0-9]+$ ]] || return 1
+  (( c >= 240 && c <= 255 ))
+}
+# Collect distinct source IPs that sshd saw (connection/auth lines carry
+# "from <ip>" or "<ip> port"). Look back over the whole journal for this boot.
+ssh_ips=$(journalctl -u ssh -u sshd --no-pager 2>/dev/null \
+  | grep -oE 'from ([0-9]{1,3}\.){3}[0-9]{1,3}' \
+  | awk '{print $2}' | sort -u)
+bad_ips=""
+if [[ -n "$ssh_ips" ]]; then
+  while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+    _ip_in_iap "$ip" || bad_ips+="$ip "
+  done <<< "$ssh_ips"
+fi
+if [[ -z "$bad_ips" ]]; then
+  PASS ssh-source-iap "All SSH source IPs are within the IAP range."
+else
+  FAIL ssh-source-iap "SSH connections seen from non-IAP IP(s) — firewall leak."
+  INFO "non-IAP SSH source IPs: $bad_ips"
 fi
 
 # 7. Token-leak hygiene
