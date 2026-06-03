@@ -136,3 +136,34 @@ def apt_apply() -> str:
         return f"Upgrade complete. {len(pkgs)} packages touched."
     except subprocess.CalledProcessError as e:
         return f"apt-get failed:\n{e.output[-1500:]}"
+
+
+def run_audit_summary() -> dict:
+    """Run the internal security audit in --summary mode.
+
+    Returns {"passed": int, "failed": int, "fails": [slug, ...], "ok": bool}.
+    The audit script's --summary output is values-free (slugs only), so the
+    result is safe to relay over Telegram. On any error, returns ok=False
+    with an "error" key rather than raising.
+    """
+    try:
+        out = subprocess.run(
+            ["sudo", "/usr/local/sbin/wg-bot-audit", "--summary"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except (subprocess.SubprocessError, OSError) as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}",
+                "passed": 0, "failed": 0, "fails": []}
+
+    passed = failed = 0
+    fails: list[str] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "SUMMARY":
+            try:
+                passed, failed = int(parts[1]), int(parts[2])
+            except ValueError:
+                pass
+        elif len(parts) == 2 and parts[0] == "FAIL":
+            fails.append(parts[1])
+    return {"ok": failed == 0, "passed": passed, "failed": failed, "fails": fails}

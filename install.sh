@@ -405,6 +405,20 @@ enable_apis() {
 create_firewall() {
   hdr "Firewall rules"
 
+  # GCP's default network ships with permissive built-in rules, including
+  # default-allow-ssh (tcp:22 from 0.0.0.0/0 with NO target tag, so it
+  # applies to every instance). Our wg-allow-ssh-iap rule is ADDITIVE, not a
+  # replacement — firewall rules are a union, so the permissive default wins
+  # and port 22 stays open to the whole internet. We must delete the default
+  # permissive rules explicitly. default-allow-rdp is equally useless here.
+  for rule in default-allow-ssh default-allow-rdp; do
+    if gcloud compute firewall-rules describe "$rule" \
+         --project="$PROJECT_ID" >/dev/null 2>&1; then
+      run gcloud compute firewall-rules delete "$rule" \
+        --project="$PROJECT_ID" --quiet
+    fi
+  done
+
   run gcloud compute firewall-rules create wg-allow-vpn \
     --project="$PROJECT_ID" \
     --direction=INGRESS --action=ALLOW \
@@ -419,7 +433,22 @@ create_firewall() {
     --source-ranges="$IAP_SSH_RANGE" \
     --target-tags=wg-vpn
 
-  ok "Firewall: WG/UDP open, SSH limited to IAP range."
+  # Verify no rule other than ours permits tcp:22. If anything still allows
+  # 22 from a non-IAP range, fail loudly rather than ship an open VM.
+  local open22
+  open22=$(gcloud compute firewall-rules list \
+    --project="$PROJECT_ID" \
+    --filter="allowed.ports=22 AND sourceRanges!=$IAP_SSH_RANGE" \
+    --format="value(name)" 2>/dev/null)
+  if [[ -n "$open22" ]]; then
+    err "Firewall verification FAILED: these rules still allow port 22 from"
+    err "outside the IAP range: $open22"
+    err "Delete them before relying on this VM:"
+    err "  gcloud compute firewall-rules delete <name> --project=$PROJECT_ID"
+    exit 1
+  fi
+
+  ok "Firewall: WG/UDP open; SSH restricted to IAP range; no public port 22."
 }
 
 # ---------- iap iam ----------

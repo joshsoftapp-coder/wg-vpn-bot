@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# audit-internal.sh — security audit from INSIDE the VM.
+#
+# Run after SSHing in via IAP:
+#   gcloud compute ssh VM_NAME --tunnel-through-iap
+#   sudo bash audit-internal.sh            # full human-readable report
+#   sudo bash audit-internal.sh --summary  # machine summary, no values (safe to relay)
+#
+# Read-only: makes no changes. Exit 0 = all PASS, 1 = one or more FAIL.
+#
+# --summary output (stdout), safe to send over Telegram — names only, no
+# paths, ports, keys, or other values:
+#   SUMMARY <passed> <failed>
+#   FAIL <check-slug>      (one per failure)
+
+set -uo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run as root: sudo bash $0" >&2
+  exit 2
+fi
+
+SUMMARY_MODE=0
+[[ "${1:-}" == "--summary" ]] && SUMMARY_MODE=1
+
+pass=0; fail=0
+declare -a failed_slugs=()
+
+green=$'\033[32m'; red=$'\033[31m'; yel=$'\033[33m'; dim=$'\033[2m'; rst=$'\033[0m'
+# $1 = short slug (safe to relay), $2 = human description (verbose only).
+PASS() { pass=$((pass+1)); [[ "$SUMMARY_MODE" -eq 1 ]] && return 0
+         printf '%s  PASS%s  %s\n' "$green" "$rst" "${2:-$1}"; }
+FAIL() { fail=$((fail+1)); failed_slugs+=("$1")
+         [[ "$SUMMARY_MODE" -eq 1 ]] && return 0
+         printf '%s  FAIL%s  %s\n' "$red" "$rst" "${2:-$1}"; }
+WARN() { [[ "$SUMMARY_MODE" -eq 1 ]] && return 0
+         printf '%s  WARN%s  %s\n' "$yel" "$rst" "$1"; }
+INFO() { [[ "$SUMMARY_MODE" -eq 1 ]] && return 0
+         printf '%s        %s%s\n' "$dim" "$1" "$rst"; }
+
+check_perm() {
+  local slug="$1" path="$2" want_own="$3" want_mode="$4"
+  if [[ ! -e "$path" ]]; then FAIL "$slug" "$path missing"; return; fi
+  local own mode
+  own=$(stat -c '%U:%G' "$path"); mode=$(stat -c '%a' "$path")
+  if [[ "$own" == "$want_own" && "$mode" == "$want_mode" ]]; then
+    PASS "$slug" "$path is $own $mode"
+  else
+    FAIL "$slug" "$path is $own $mode (want $want_own $want_mode)"
+  fi
+}
+
+[[ "$SUMMARY_MODE" -eq 0 ]] && { echo "== Internal audit on $(hostname) =="; echo; }
+
+# 1. Sensitive file permissions
+check_perm perm-config  /etc/wg-admin-bot/config.yaml root:wgbot 660
+check_perm perm-wgconf  /etc/wireguard/wg0.conf       root:wgbot 660
+check_perm perm-serverkey /etc/wireguard/server.key   root:root  600
+[[ -e /var/lib/wg-admin-bot/state.json ]] && \
+  check_perm perm-state /var/lib/wg-admin-bot/state.json wgbot:wgbot 600
+dirmode=$(stat -c '%a' /etc/wireguard 2>/dev/null)
+dirown=$(stat -c '%U:%G' /etc/wireguard 2>/dev/null)
+if [[ "$dirmode" == "750" && "$dirown" == "root:wgbot" ]]; then
+  PASS perm-wgdir "/etc/wireguard is root:wgbot 750"
+else
+  FAIL perm-wgdir "/etc/wireguard is $dirown $dirmode (want root:wgbot 750)"
+fi
+
+# 2. Bot runs as wgbot
+botuser=$(systemctl show -p User --value wg-admin-bot.service 2>/dev/null)
+if [[ "$botuser" == "wgbot" ]]; then
+  PASS bot-user "Bot service runs as wgbot."
+else
+  FAIL bot-user "Bot service User='$botuser' (want wgbot)."
+fi
+
+# 3. Core services active
+for unit in wg-quick@wg0 wg-admin-bot; do
+  if systemctl is-active --quiet "$unit"; then
+    PASS "svc-${unit%%@*}" "$unit is active."
+  else
+    FAIL "svc-${unit%%@*}" "$unit is not active."
+  fi
+done
+
+# 4. sudoers strict allowlist
+if [[ -f /etc/sudoers.d/wgbot ]]; then
+  if visudo -cf /etc/sudoers.d/wgbot >/dev/null 2>&1; then
+    PASS sudoers-parse "sudoers file parses cleanly."
+  else
+    FAIL sudoers-parse "sudoers file fails visudo -c."
+  fi
+  if grep -qE 'NOPASSWD:\s*ALL|wgbot\s+ALL=\(ALL' /etc/sudoers.d/wgbot; then
+    FAIL sudoers-scope "sudoers grants blanket ALL."
+  else
+    PASS sudoers-scope "sudoers contains no blanket ALL grant."
+  fi
+else
+  FAIL sudoers-present "/etc/sudoers.d/wgbot missing."
+fi
+
+# 5. Listening sockets
+tcp_listen=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u | tr '\n' ' ')
+INFO "TCP listening ports: ${tcp_listen:-none}"
+unexpected_tcp=$(echo "$tcp_listen" | tr ' ' '\n' | grep -vE '^(22)?$' || true)
+if [[ -z "$unexpected_tcp" ]]; then
+  PASS listen-tcp "No unexpected TCP listeners (only sshd:22)."
+else
+  FAIL listen-tcp "Unexpected TCP listeners: $(echo "$unexpected_tcp" | tr '\n' ' ')"
+fi
+if ss -tlnp 2>/dev/null | grep -q 'python3'; then
+  FAIL bot-no-listen "Bot is listening on a TCP socket (should be outbound-only)."
+else
+  PASS bot-no-listen "Bot owns no listening socket."
+fi
+
+# 6. SSH hardening
+sshd_eff=$(sshd -T 2>/dev/null)
+if echo "$sshd_eff" | grep -qi '^passwordauthentication no'; then
+  PASS ssh-nopassword "SSH password authentication disabled."
+else
+  FAIL ssh-nopassword "SSH password authentication is enabled."
+fi
+if echo "$sshd_eff" | grep -qiE '^permitrootlogin (no|prohibit-password)'; then
+  PASS ssh-rootlogin "SSH root login restricted."
+else
+  WARN "PermitRootLogin permissive: $(echo "$sshd_eff" | grep -i permitrootlogin)"
+fi
+
+# 7. Token-leak hygiene
+leak=$(journalctl -u wg-admin-bot --no-pager 2>/dev/null | grep -cE 'bot[0-9]{6,}:AA' || true)
+if [[ "${leak:-0}" -eq 0 ]]; then
+  PASS token-leak "Bot token does not appear in the journal."
+else
+  FAIL token-leak "Bot token appears in $leak journal line(s)."
+fi
+
+# 8. IP forwarding
+if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; then
+  PASS ip-forward "IPv4 forwarding enabled."
+else
+  FAIL ip-forward "IPv4 forwarding disabled."
+fi
+
+# 9. NAT / FORWARD
+wan=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+INFO "WAN interface: ${wan:-unknown}"
+if iptables -t nat -C POSTROUTING -o "${wan:-ens4}" -j MASQUERADE 2>/dev/null; then
+  PASS nat-masquerade "NAT MASQUERADE present on $wan."
+else
+  FAIL nat-masquerade "NAT MASQUERADE missing on $wan."
+fi
+if iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null; then
+  PASS forward-wg0 "FORWARD accept rule present for wg0."
+else
+  FAIL forward-wg0 "FORWARD accept rule missing for wg0."
+fi
+
+# 10. WireGuard health (authoritative liveness)
+if wg show wg0 >/dev/null 2>&1; then
+  PASS wg-up "WireGuard interface wg0 is up."
+  port=$(wg show wg0 listen-port 2>/dev/null)
+  if [[ "$port" == "51820" ]]; then
+    PASS wg-port "wg0 listening on udp:51820."
+  else
+    WARN "wg0 listen-port is '$port' (expected 51820)."
+  fi
+  npeers=$(wg show wg0 peers 2>/dev/null | grep -c .)
+  INFO "configured peers: $npeers"
+  latest=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -nr | head -1)
+  if [[ -n "$latest" && "$latest" -gt 0 ]]; then
+    now=$(date +%s); INFO "most recent handshake: $(( now - latest ))s ago"
+  else
+    INFO "no peer handshake yet (expected on a fresh VM)."
+  fi
+else
+  FAIL wg-up "WireGuard interface wg0 is not present."
+fi
+
+# 11. Unattended upgrades
+if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
+  PASS unattended "unattended-upgrades enabled."
+else
+  WARN "unattended-upgrades not enabled."
+fi
+
+# 12. Login-shell accounts (review)
+shells=$(getent passwd | awk -F: '$7 !~ /(nologin|false)$/ {print $1}' | tr '\n' ' ')
+INFO "accounts with a login shell: ${shells:-none}"
+
+# Output
+if [[ "$SUMMARY_MODE" -eq 1 ]]; then
+  echo "SUMMARY ${pass} ${fail}"
+  for slug in "${failed_slugs[@]:-}"; do
+    [[ -n "$slug" ]] && echo "FAIL $slug"
+  done
+else
+  echo
+  echo "== Summary: ${pass} passed, ${fail} failed =="
+fi
+
+[[ "$fail" -eq 0 ]]

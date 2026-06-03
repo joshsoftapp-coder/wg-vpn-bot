@@ -120,6 +120,7 @@ fi
 # ---------- helper script ----------
 install -m 0755 "$BUNDLE/wg-helpers/reset-admin.sh" /usr/local/sbin/wg-bot-reset-admin
 install -m 0755 "$BUNDLE/wg-helpers/wg-bot-doctor" /usr/local/sbin/wg-bot-doctor
+install -m 0755 "$BUNDLE/wg-helpers/wg-bot-audit" /usr/local/sbin/wg-bot-audit
 
 # ---------- sudoers (install EARLY, before any sudo calls) ----------
 install -m 0440 -o root -g root "$BUNDLE/sudoers.d/wgbot" /etc/sudoers.d/wgbot

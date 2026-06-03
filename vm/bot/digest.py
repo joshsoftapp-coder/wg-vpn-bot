@@ -64,13 +64,34 @@ def build_vm_digest() -> str:
             # Put everything inside a single backtick code span so neither the
             # 'id' label nor any character in the username can break Markdown.
             lines.append(f"  • `id={uid} @{uname}`")
+
+    # Security audit summary — counts and check names only, never values.
+    audit = vm_cmds.run_audit_summary()
+    lines.append("")
+    if not audit["ok"] and audit.get("error"):
+        lines.append("*Security:* ⚠️ audit could not run")
+    else:
+        total = audit["passed"] + audit["failed"]
+        if audit["failed"] == 0:
+            lines.append(f"*Security:* ✅ {audit['passed']}/{total} checks passed")
+        else:
+            fails = ", ".join(f"`{s}`" for s in audit["fails"])
+            lines.append(
+                f"*Security:* ⚠️ {audit['passed']}/{total} passed — "
+                f"failed: {fails} (see /audit)"
+            )
+
+    # Where to find the full logs (the digest is a summary, not the record).
+    lines.append("")
+    lines.append("Full logs — SSH in and run:")
+    lines.append("`sudo journalctl -u wg-admin-bot`")
+    lines.append("`sudo less /var/log/wg-admin-bot/audit.log`")
     return "\n".join(lines)
 
 
 def build_wg_digest() -> str:
     peers = wg_cmds.list_peers()
     rt = wg_cmds.runtime_status()
-    bindings = state.get("peer_chat_ids", {}) or {}
     now = int(time.time())
     ip = wg_cmds.server_external_ip() or "?"
 
@@ -79,7 +100,6 @@ def build_wg_digest() -> str:
         "",
         f"Public IP: `{ip}`",
         f"Total peers: `{len(peers)}`",
-        f"Claimed peers: `{sum(1 for p in peers if p.name in bindings)}`",
     ]
 
     # Peers active in last 24h
@@ -95,9 +115,8 @@ def build_wg_digest() -> str:
         lines.append("*Active in last 24h:*")
         for p, last, rx, tx in active_24h:
             ago_min = (now - last) // 60
-            claimed = "✉ " if p.name in bindings else ""
             lines.append(
-                f"• {claimed}`{p.name}` — {ago_min}m ago — "
+                f"• `{p.name}` — {ago_min}m ago — "
                 f"↓{vm_cmds.fmt_bytes(rx)} ↑{vm_cmds.fmt_bytes(tx)}"
             )
     else:

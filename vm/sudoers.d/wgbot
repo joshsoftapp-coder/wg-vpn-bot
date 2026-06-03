@@ -36,6 +36,11 @@ wgbot ALL=(root) NOPASSWD: /usr/bin/journalctl -u ssh *
 wgbot ALL=(root) NOPASSWD: /usr/bin/apt-get update
 wgbot ALL=(root) NOPASSWD: /usr/bin/apt-get -y -s upgrade
 wgbot ALL=(root) NOPASSWD: /usr/bin/apt-get -y upgrade
+wgbot ALL=(root) NOPASSWD: /usr/bin/apt-get -y -o Dpkg::Options::=--force-confold upgrade
+
+# Read-only security audit (summary mode only — emits pass/fail counts and
+# check names, never values). Used by /audit and the daily digest.
+wgbot ALL=(root) NOPASSWD: /usr/local/sbin/wg-bot-audit --summary
 
 # OS lifecycle — destructive, gated by YES confirmation in the bot
 wgbot ALL=(root) NOPASSWD: /sbin/reboot

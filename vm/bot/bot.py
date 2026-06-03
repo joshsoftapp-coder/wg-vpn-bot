@@ -37,6 +37,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
+# PTB logs every HTTP request at INFO, and the URL embeds the bot token
+# (https://api.telegram.org/bot<TOKEN>/getUpdates). At INFO that writes the
+# token into the systemd journal on every poll. Raise these loggers to
+# WARNING so the token never lands in logs; real errors still surface.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
 
 # =========== send helpers ===========
 
@@ -489,6 +497,33 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @admin_only
+async def cmd_audit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    r = vm_cmds.run_audit_summary()
+    if not r["ok"] and r.get("error"):
+        await update.effective_message.reply_text(
+            f"⚠️ Audit could not run: `{r['error']}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    total = r["passed"] + r["failed"]
+    if r["failed"] == 0:
+        text = (
+            f"*Security audit* ✅\n"
+            f"`{r['passed']}/{total}` checks passed."
+        )
+    else:
+        # Slugs only — no values. Safe to send over Telegram.
+        fails = "\n".join(f"• `{slug}`" for slug in r["fails"])
+        text = (
+            f"*Security audit* ⚠️\n"
+            f"`{r['passed']}/{total}` passed, `{r['failed']}` failed:\n"
+            f"{fails}\n\n"
+            f"_Run_ `sudo wg-bot-audit` _over SSH for detail._"
+        )
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+@admin_only
 async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args:
         await update.effective_message.reply_text("Usage: /logs wg|ssh|bot [n]")
@@ -621,6 +656,7 @@ def _help_text() -> str:
         "  /remove NAME YES — delete peer entirely\n"
         "\n*VM (host):*\n"
         "  /status — health\n"
+        "  /audit — security audit summary\n"
         "  /logs wg|ssh|bot [n] — tail journald\n"
         "  /reboot YES, /shutdown YES, /restart wg\n"
         "  /update — dry-run, /update YES — apply\n"
@@ -738,6 +774,7 @@ def main() -> None:
 
     # Admin: VM
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("audit", cmd_audit))
     app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(CommandHandler("reboot", cmd_reboot))
     app.add_handler(CommandHandler("shutdown", cmd_shutdown))
