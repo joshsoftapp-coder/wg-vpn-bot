@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from pathlib import Path as _Path
 import time
 import urllib.error
 import urllib.parse
@@ -21,6 +22,23 @@ import wg_cmds
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("digest")
+
+
+def _svc_active(unit: str) -> bool:
+    """Unit liveness via its cgroup — no D-Bus, no root, no subprocess.
+
+    Unprivileged `systemctl is-active` needs the D-Bus system bus, which
+    the GCP Debian image may not ship — it then errors and a healthy unit
+    reads as inactive (observed on a real VM). The unit's cgroup.procs
+    file is world-readable and non-empty iff the service has live
+    processes (cgroup v2, Debian 12 default)."""
+    try:
+        procs = _Path(
+            f"/sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs"
+        ).read_text()
+        return any(ln.strip() for ln in procs.splitlines())
+    except OSError:
+        return False
 
 
 def build_vm_digest() -> str:
@@ -45,6 +63,10 @@ def build_vm_digest() -> str:
         f"Mem used: `{mem_pct}%`",
         f"Disk used: `{disk['percent']}%` ({vm_cmds.fmt_bytes(disk['free_b'])} free)",
         f"WireGuard: {'🟢 active' if wg_cmds.wg_active() else '🔴 inactive'}",
+        # This digest is sent by an independent systemd timer, NOT by the
+        # bot — so it still arrives when the bot is dead and this line is
+        # the dead-man's signal that makes a dead bot visible within 24h.
+        f"Bot: {'🟢 active' if _svc_active('wg-admin-bot') else '🔴 INACTIVE — SSH in: systemctl status wg-admin-bot'}",
     ]
     if recent_dms:
         lines.append("")

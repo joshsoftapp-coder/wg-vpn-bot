@@ -16,7 +16,7 @@ cd wg-vpn-bot
 ## What you get
 
 - GCP e2-micro VM (Debian 12) running kernel WireGuard
-- Telegram bot to manage peers, reboot, update, and monitor — from your phone
+- Telegram bot to manage peers, reboot, and monitor — from your phone
 - SSH closed to the internet (Google IAP only)
 - Static IP, daily digests, audit log, diagnostic tool (`wg-bot-doctor`)
 
@@ -34,7 +34,13 @@ recovery window, $0 while deleted).
 
 ## Requirements
 
-- macOS or Linux, bash 4+, `gcloud`, `jq`, `curl`
+- bash 4+, `gcloud`, `jq`, `curl`
+  - **Linux**: works as-is (any current distro ships bash 5)
+  - **macOS**: `brew install bash` — the system bash is 3.2; the installer
+    finds the homebrew bash automatically (Apple Silicon and Intel paths)
+  - **Windows**: not tested. WSL (Ubuntu) should behave like Linux with
+    `gcloud` installed inside WSL; Git Bash may or may not work. You're
+    in unsupported territory either way.
 - Google account with a billing account set up
 - Telegram (admin only — peers don't need it)
 

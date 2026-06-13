@@ -1,9 +1,8 @@
 """
 wg-admin-bot — Telegram bot dispatcher.
 
-Three classes of caller:
+Two classes of caller:
   • admin     — TOFU-paired, can run all commands
-  • peer      — claimed via /claim, can DM bot (only /leave does something)
   • stranger  — anyone else, ignored (DM recorded for digest summary)
 """
 from __future__ import annotations
@@ -11,12 +10,15 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
+import socket
 from datetime import datetime
 from pathlib import Path
 
 import qrcode
 from telegram import InputFile, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler,
     ContextTypes, MessageHandler, filters,
@@ -24,7 +26,6 @@ from telegram.ext import (
 
 import alerts
 import auth
-import claim
 import config
 import digest
 import state
@@ -47,6 +48,28 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+# =========== systemd integration ===========
+
+def _sd_notify(msg: str) -> None:
+    """Send a notification to systemd (Type=notify + WatchdogSec).
+
+    READY=1 marks startup complete; WATCHDOG=1 is the liveness ping sent
+    from the tick loop. Silently a no-op when NOTIFY_SOCKET is unset
+    (local runs, tests). No external deps — raw datagram to the socket.
+    """
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):  # abstract namespace
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.send(msg.encode())
+    except OSError as e:
+        log.warning("sd_notify failed: %s", e)
+
+
 # =========== send helpers ===========
 
 async def _send_admin(app: Application, text: str, **kw) -> None:
@@ -60,17 +83,18 @@ async def _send_admin(app: Application, text: str, **kw) -> None:
         log.error("admin send failed: %s", e)
 
 
-async def _send_peer(app: Application, peer_name: str, text: str, **kw) -> bool:
-    """Send to claimed peer if bound; otherwise return False."""
-    cid = claim.chat_id_for(peer_name)
-    if cid is None:
-        return False
+async def _reply_md(message, text: str) -> None:
+    """Reply with Markdown; on a parse rejection, resend as plain text.
+
+    Telegram rejects the whole message (HTTP 400) if interpolated content —
+    e.g. a journal line containing a backtick — breaks Markdown. Better an
+    unformatted reply than 'Command failed: BadRequest'.
+    """
     try:
-        await app.bot.send_message(chat_id=cid, text=text, **kw)
-        return True
-    except Exception as e:
-        log.error("peer send to %s failed: %s", peer_name, e)
-        return False
+        await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except BadRequest as e:
+        log.warning("markdown reply failed (%s); resending plain", e)
+        await message.reply_text(text)
 
 
 async def _send_peer_config(app: Application, chat_id: int, peer: wg_cmds.Peer) -> None:
@@ -93,19 +117,6 @@ async def _send_peer_config(app: Application, chat_id: int, peer: wg_cmds.Peer) 
     )
 
 
-async def _broadcast_peers(app: Application, text: str) -> int:
-    """Send text to all claimed peers. Returns number sent."""
-    bindings = state.get("peer_chat_ids", {}) or {}
-    n = 0
-    for peer_name, cid in bindings.items():
-        try:
-            await app.bot.send_message(chat_id=int(cid), text=text)
-            n += 1
-        except Exception as e:
-            log.warning("broadcast to %s failed: %s", peer_name, e)
-    return n
-
-
 # =========== decorator ===========
 
 def admin_only(handler):
@@ -122,15 +133,11 @@ def admin_only(handler):
 
 def _record_stranger(user, message) -> None:
     """A non-admin DM'd the bot. Record for digest summary."""
-    # Don't treat claimed peers as strangers — they have their own handlers.
-    peer = auth.is_claimed_peer(user.id)
-    if peer:
-        return
     text = message.text if message else ""
     auth.record_unauthorized(user.id, user.username, text or "")
 
 
-# =========== /start, /claim, /leave (open or peer-facing) ===========
+# =========== /start (open) ===========
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     u = update.effective_user
@@ -146,22 +153,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if auth.is_admin(u.id):
             await m.reply_text("You're already the admin. Try /help.")
             return
-        peer = auth.is_claimed_peer(u.id)
-        if peer:
-            await m.reply_text(
-                f"You're claimed as peer '{peer}'. "
-                f"You can /leave YES to remove yourself."
-            )
-            return
         # Stranger
-        await m.reply_text(
-            "👋 Hi! This is a private VPN bot.\n\n"
-            "If your admin sent you a claim token, your next message should be:\n\n"
-            "    /claim ABCD-EFGH-IJKL\n\n"
-            "(replace ABCD-EFGH-IJKL with the actual token you received).\n\n"
-            "Telegram's UI made you press Start before letting you type — "
-            "that's why this is two steps."
-        )
+        await m.reply_text("👋 Hi! This is a private VPN bot.")
         _record_stranger(u, m)
         return
 
@@ -214,86 +207,6 @@ async def _deliver_first_peer(app: Application, chat_id: int) -> None:
         return
     await _send_peer_config(app, chat_id, peer)
     state.delete("first_peer_secret")
-
-
-async def cmd_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    u = update.effective_user
-    m = update.effective_message
-    if u is None or m is None:
-        return
-    if auth.is_admin(u.id):
-        await m.reply_text("Admins don't claim. Use /add to create peers.")
-        return
-
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].strip():
-        await m.reply_text("Usage: /claim YOUR-TOKEN-HERE")
-        return
-    token = parts[1].strip()
-
-    ok, msg, peer_name = claim.try_claim(u.id, token)
-    if not ok:
-        await m.reply_text(msg)
-        _record_stranger(u, m)
-        return
-
-    auth.audit(u.id, "claim_ok", peer_name or "")
-    # Send the config — but we don't have the private key (only at creation).
-    peer = wg_cmds.get_peer_by_name(peer_name)
-    if not peer:
-        await m.reply_text(
-            f"Claim recorded for '{peer_name}', but the peer no longer exists. "
-            "Ask your admin."
-        )
-        return
-
-    await m.reply_text(
-        f"✅ Claimed peer '{peer_name}'.\n"
-        f"Your admin will now /reissue your config — you'll receive it here shortly."
-    )
-    # Notify admin
-    await _send_admin(
-        ctx.application,
-        f"📥 {peer_name} claimed by user_id={u.id} username=@{u.username or '?'}.\n"
-        f"Run /reissue {peer_name} to send their config."
-    )
-
-
-async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    u = update.effective_user
-    m = update.effective_message
-    if u is None or m is None:
-        return
-
-    peer_name = auth.is_claimed_peer(u.id)
-    if not peer_name:
-        # Stranger or admin
-        if auth.is_admin(u.id):
-            await m.reply_text("Admins don't /leave. Use /remove <name> YES to remove peers.")
-        return  # silent for strangers
-
-    parts = (m.text or "").split()
-    if len(parts) < 2 or parts[1].upper() != "YES":
-        await m.reply_text(
-            f"⚠ This will REMOVE your VPN access (peer '{peer_name}').\n"
-            "Confirm with: /leave YES"
-        )
-        return
-
-    try:
-        wg_cmds.remove(peer_name)
-        claim.remove_peer_bindings(peer_name)
-        await m.reply_text(
-            f"👋 Removed peer '{peer_name}'. Your VPN config will stop working. Goodbye."
-        )
-        auth.audit(u.id, "peer_self_remove", peer_name)
-        await _send_admin(
-            ctx.application,
-            f"👋 Peer '{peer_name}' left voluntarily (user_id={u.id} username=@{u.username or '?'})."
-        )
-    except Exception as e:
-        log.exception("self-remove failed")
-        await m.reply_text(f"❌ Failed: {e}")
 
 
 # =========== admin: WG group ===========
@@ -381,7 +294,6 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         wg_cmds.remove(name)
-        claim.remove_peer_bindings(name)
         auth.audit(update.effective_user.id, "peer_remove", name)
         await update.effective_message.reply_text(f"🗑 Removed peer '{name}'.")
     except (ValueError, RuntimeError) as e:
@@ -407,62 +319,6 @@ async def cmd_reissue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Send the fresh config to admin
     await _send_peer_config(ctx.application, update.effective_chat.id, peer)
     await update.effective_message.reply_text(f"✅ Reissued '{name}'.")
-
-
-@admin_only
-async def cmd_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.args:
-        await update.effective_message.reply_text("Usage: /invite <name>")
-        return
-    name = ctx.args[0]
-    try:
-        tok = claim.create_invite(name)
-    except ValueError as e:
-        await update.effective_message.reply_text(f"❌ {e}")
-        return
-    auth.audit(update.effective_user.id, "invite", name)
-    bot_user = config.get("telegram.bot_username", "your_bot")
-    await update.effective_message.reply_text(
-        f"📤 Send this to '{name}':\n\n"
-        f"Open Telegram, find @{bot_user}, send:\n"
-        f"`/claim {tok}`\n\n"
-        f"Expires in 30 minutes.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-@admin_only
-async def cmd_unclaim(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.args:
-        await update.effective_message.reply_text("Usage: /unclaim <name>")
-        return
-    name = ctx.args[0]
-    if claim.unclaim(name):
-        auth.audit(update.effective_user.id, "unclaim", name)
-        await update.effective_message.reply_text(
-            f"✅ Cleared claim binding for '{name}'. "
-            f"Future /reissue will DM you instead."
-        )
-    else:
-        await update.effective_message.reply_text(f"No claim binding for '{name}'.")
-
-
-@admin_only
-async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send wg0.conf as a Telegram document."""
-    try:
-        text = Path("/etc/wireguard/wg0.conf").read_text()
-    except OSError as e:
-        await update.effective_message.reply_text(f"❌ Cannot read wg0.conf: {e}")
-        return
-    auth.audit(update.effective_user.id, "export", "")
-    await update.effective_message.reply_document(
-        document=InputFile(io.BytesIO(text.encode()), filename="wg0.conf"),
-        caption=(
-            "⚠ Contains server private key. Store securely.\n"
-            "To restore: fresh install, then replace /etc/wireguard/wg0.conf via SSH."
-        ),
-    )
 
 
 # =========== admin: VM group ===========
@@ -537,14 +393,12 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         out = "(no output)"
     if len(out) > 3800:
         out = out[-3800:]
-    await update.effective_message.reply_text(f"```\n{out}\n```", parse_mode=ParseMode.MARKDOWN)
+    await _reply_md(update.effective_message, f"```\n{out}\n```")
 
 
 @admin_only
 async def cmd_reboot(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if ctx.args and ctx.args[0].upper() == "YES":
-        await _broadcast_peers(ctx.application,
-                               "🔁 VPN is rebooting (~60 seconds). You'll be reconnected automatically.")
         await update.effective_message.reply_text("🔁 Rebooting. See you in a minute.")
         auth.audit(update.effective_user.id, "reboot", "")
         await asyncio.sleep(2)
@@ -558,8 +412,6 @@ async def cmd_reboot(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @admin_only
 async def cmd_shutdown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if ctx.args and ctx.args[0].upper() == "YES":
-        await _broadcast_peers(ctx.application,
-                               "⛔ VPN is shutting down. It will be unreachable until the admin starts it again.")
         await update.effective_message.reply_text(
             "⛔ Shutting down. Bot becomes unreachable. Start VM from the GCP Console to bring it back."
         )
@@ -574,34 +426,13 @@ async def cmd_shutdown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @admin_only
-@admin_only
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args or ctx.args[0].lower() != "wg":
         await update.effective_message.reply_text("Usage: /restart wg")
         return
-    await _broadcast_peers(ctx.application,
-                           "🔄 VPN restarting (~5 seconds). Reconnection should be automatic.")
     ok, msg = vm_cmds.restart_wg()
     auth.audit(update.effective_user.id, "restart_wg", "ok" if ok else "fail")
     await update.effective_message.reply_text(("✅ " if ok else "❌ ") + msg)
-
-
-@admin_only
-async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if ctx.args and ctx.args[0].upper() == "YES":
-        await _broadcast_peers(ctx.application,
-                               "🔧 VPN host is applying security updates. Brief connection drops possible.")
-        await update.effective_message.reply_text("Applying upgrades…")
-        out = vm_cmds.apt_apply()
-        auth.audit(update.effective_user.id, "update_apply", "")
-        await update.effective_message.reply_text(f"```\n{out[-3500:]}\n```", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.effective_message.reply_text("Checking what would change (dry-run)…")
-        out = vm_cmds.apt_dry_run()
-        await update.effective_message.reply_text(
-            f"```\n{out[-3500:]}\n```\n\nTo apply: /update YES",
-            parse_mode=ParseMode.MARKDOWN,
-        )
 
 
 @admin_only
@@ -616,7 +447,7 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if which in ("vm", "both"):
         try:
             text = digest.build_vm_digest()
-            await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            await _reply_md(update.effective_message, text)
             sent_any = True
         except Exception as e:
             log.exception("vm digest failed")
@@ -624,7 +455,7 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if which in ("wg", "both"):
         try:
             text = digest.build_wg_digest()
-            await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            await _reply_md(update.effective_message, text)
             sent_any = True
         except Exception as e:
             log.exception("wg digest failed")
@@ -660,10 +491,8 @@ def _help_text() -> str:
         "  /audit — security audit summary\n"
         "  /logs wg|ssh|bot [n] — tail journald\n"
         "  /reboot YES, /shutdown YES, /restart wg\n"
-        "  /update — dry-run, /update YES — apply\n"
         "  /digest [vm|wg] — show status digest now\n"
         "\n*Misc:*\n"
-        "  /export — download wg0.conf backup\n"
         "  /whoami — your user info\n"
     )
 
@@ -678,12 +507,6 @@ async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if auth.is_admin(u.id):
         await m.reply_text("Unknown command. Try /help.")
         return
-    peer = auth.is_claimed_peer(u.id)
-    if peer:
-        await m.reply_text(
-            f"You're peer '{peer}'. Your only command here is /leave YES."
-        )
-        return
     # Stranger
     _record_stranger(u, m)
 
@@ -693,6 +516,9 @@ async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _alerts_tick_loop(sink: alerts.AlertSink) -> None:
     while True:
         await asyncio.sleep(60)
+        # systemd watchdog ping (WatchdogSec=300; 60s pings = 5x margin).
+        # If the event loop hangs, pings stop and systemd kills + restarts.
+        _sd_notify("WATCHDOG=1")
         try:
             await sink.tick()
         except Exception:
@@ -713,6 +539,9 @@ async def _post_init(app: Application) -> None:
     app.bot_data["alert_sink"] = sink
     app.create_task(alerts.listen_fifo(sink))
     app.create_task(_alerts_tick_loop(sink))
+
+    # Tell systemd (Type=notify) startup is complete; arms the watchdog.
+    _sd_notify("READY=1")
 
     aid = config.admin_id()
     if aid is not None:
@@ -756,11 +585,6 @@ def main() -> None:
 
     # Open-ish
     app.add_handler(CommandHandler("start", cmd_start))
-    # /claim and /leave are disabled in this build — the peer-claim flow
-    # has known bugs. Code in claim.py and the handlers are kept for a
-    # future re-enable. Re-add the lines below to restore:
-    # app.add_handler(CommandHandler("claim", cmd_claim))
-    # app.add_handler(CommandHandler("leave", cmd_leave))
 
     # Admin: WG
     app.add_handler(CommandHandler("peers", cmd_peers))
@@ -768,10 +592,6 @@ def main() -> None:
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("reissue", cmd_reissue))
-    # /invite and /unclaim disabled along with the claim flow.
-    # app.add_handler(CommandHandler("invite", cmd_invite))
-    # app.add_handler(CommandHandler("unclaim", cmd_unclaim))
-    app.add_handler(CommandHandler("export", cmd_export))
 
     # Admin: VM
     app.add_handler(CommandHandler("status", cmd_status))
@@ -780,7 +600,6 @@ def main() -> None:
     app.add_handler(CommandHandler("reboot", cmd_reboot))
     app.add_handler(CommandHandler("shutdown", cmd_shutdown))
     app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("digest", cmd_digest))
 
     # Meta

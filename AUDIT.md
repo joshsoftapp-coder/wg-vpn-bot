@@ -77,3 +77,16 @@ Both scripts end with a summary like:
 ```
 
 Zero failures is the bar for a freshly installed VM before you rely on it.
+
+## Accepted exposure (by design)
+
+- **The bot token and the one-time pairing token persist in the VM's
+  startup-script metadata** for the life of the instance. Anyone with
+  read access to the GCP project (and any process on the VM, via the
+  metadata server) can recover them. In the single-owner project model
+  this adds nothing beyond what project access already grants. To rotate
+  the bot token: revoke it in @BotFather, then `./uninstall.sh` +
+  `./install.sh`.
+- **Admin commands transit Telegram's servers.** Management traffic is
+  not private from Telegram; VPN data-plane traffic never touches the
+  bot or Telegram.

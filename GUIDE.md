@@ -25,7 +25,9 @@ your config and issue a new one.
 ### First-time install
 
 **Prerequisites:** `gcloud` authenticated, `jq`, `curl`, bash 4+, a GCP
-billing account, Telegram on your phone.
+billing account, Telegram on your phone. Linux works as-is; macOS needs
+`brew install bash` (picked up automatically); Windows is untested — use
+WSL with `gcloud` installed inside it, at your own risk.
 
 ```bash
 git clone https://github.com/joshsoftapp-coder/wg-vpn-bot
@@ -63,10 +65,31 @@ sudo wg-bot-reset-admin
 | `/logs wg\|ssh\|bot` | Tail the journal |
 | `/reboot YES` | Reboot (~60s, peers reconnect automatically) |
 | `/restart wg` | Restart WireGuard only |
-| `/update` | Show pending security upgrades |
-| `/update YES` | Apply them |
+| `/audit` | Security audit summary |
 | `/digest` | On-demand status digest |
-| `/export` | DM you `wg0.conf` as a backup |
+
+Security updates apply automatically (unattended-upgrades); the VM
+reboots itself at 04:00 UTC when a kernel update requires it (~60s of
+VPN downtime, peers reconnect automatically). There is no backup/export
+command by design — recovery is rebuild (`./uninstall.sh` + `./install.sh`).
+
+### Data costs (read this)
+
+The free tier includes **1 GB of outbound traffic per month**; beyond that
+it's ~$0.12/GB. The default peer config routes **all** your traffic through
+the VPN (`AllowedIPs = 0.0.0.0/0`), so streaming video through it will blow
+past 1 GB quickly. Two ways to stay free:
+
+- **Android:** WireGuard app → edit tunnel → **Excluded applications** →
+  exclude heavy apps (Netflix, YouTube, Zoom, Teams, ...). Their traffic
+  bypasses the VPN; everything else stays tunneled. This is the cleanest
+  split tunnel — no IP lists to maintain.
+- Toggle the tunnel **on only when you need it** (one tap; iOS has no
+  per-app exclusion, so this is the iOS answer).
+- Advanced: replace `AllowedIPs` with a computed exclusion list of CIDRs.
+  Note WireGuard routes by **IP, not domain** — you cannot exclude
+  "netflix.com", and big services' IP ranges shift constantly, so prefer
+  the two options above.
 
 ### SSH access
 

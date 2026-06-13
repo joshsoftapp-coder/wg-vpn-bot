@@ -42,19 +42,29 @@ sysctl -p /etc/sysctl.d/99-wg-forward.conf
 # its own TZ via OnCalendar=. VM logs in UTC keep things simple.
 
 # ---------- unattended security upgrades ----------
-cat > /etc/apt/apt.conf.d/50unattended-upgrades.local <<EOF
+# Automatic-Reboot: kernel/libc security updates only take effect after a
+# reboot. Off, a months-running VM accumulates downloaded-but-unbooted
+# kernels. Reboots are safe (all config/state writes are first-boot-guarded)
+# and cost ~60s of VPN downtime at 04:00 UTC.
+# Filename must have NO extension: apt silently ignores unknown extensions
+# (".local" was ignored for the project's whole life — caught by acceptance
+# tests). "51" sorts after the package's 50unattended-upgrades so our
+# values win.
+cat > /etc/apt/apt.conf.d/51wg-vpn-bot <<EOF
 Unattended-Upgrade::Allowed-Origins {
     "\${distro_id}:\${distro_codename}-security";
 };
-Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 EOF
+rm -f /etc/apt/apt.conf.d/50unattended-upgrades.local
 systemctl enable --now unattended-upgrades
 
 # ---------- apt conffile policy ----------
-# Keep the existing config file on conflict, never prompt. This makes any
-# non-interactive apt run (the bot's /update YES, unattended-upgrades) safe
-# without passing -o Dpkg::Options::= on the command line — which can't be
-# expressed in a sudoers command spec (the '=' breaks sudoers parsing).
+# Keep the existing config file on conflict, never prompt. The bot no longer
+# runs apt (the /update command was removed in v0.3.0), but this policy is
+# kept for unattended-upgrades: without it, packages whose upgrade would
+# raise a conffile prompt are held back indefinitely.
 cat > /etc/apt/apt.conf.d/90wg-bot-noninteractive <<'EOF'
 Dpkg::Options {
     "--force-confdef";
@@ -133,6 +143,7 @@ fi
 install -m 0755 "$BUNDLE/wg-helpers/reset-admin.sh" /usr/local/sbin/wg-bot-reset-admin
 install -m 0755 "$BUNDLE/wg-helpers/wg-bot-doctor" /usr/local/sbin/wg-bot-doctor
 install -m 0755 "$BUNDLE/wg-helpers/wg-bot-audit" /usr/local/sbin/wg-bot-audit
+install -m 0755 "$BUNDLE/wg-helpers/crash-notify.py" /usr/local/sbin/wg-bot-crash-notify
 
 # ---------- sudoers (install EARLY, before any sudo calls) ----------
 install -m 0440 -o root -g root "$BUNDLE/sudoers.d/wgbot" /etc/sudoers.d/wgbot
@@ -300,7 +311,15 @@ install -m 0755 "$BUNDLE/watchers/disk-check.sh" /usr/local/sbin/wg-bot-disk-che
 install -m 0755 "$BUNDLE/watchers/wg-health.sh"  /usr/local/sbin/wg-bot-wg-health
 
 # PAM hook for SSH login alerts
-if ! grep -q 'wg-bot-ssh-login' /etc/pam.d/sshd; then
+# Anchored guard: the rule must exist as a real (non-comment) line. The
+# Google OS Login section ends the file WITHOUT a trailing newline, so a
+# bare `echo >>` glues the rule onto their closing comment — PAM then
+# never sees it (found by acceptance testing: SSH alerts silently dead).
+# The newline guard fixes the append; the anchored grep also repairs a
+# previously-glued file on the next boot (the old garbage stays inside a
+# comment, harmless).
+if ! grep -qE '^session[[:space:]]+optional[[:space:]]+pam_exec\.so[[:space:]]+/usr/local/sbin/wg-bot-ssh-login' /etc/pam.d/sshd; then
+  [ -n "$(tail -c1 /etc/pam.d/sshd)" ] && echo >> /etc/pam.d/sshd
   echo "session optional pam_exec.so /usr/local/sbin/wg-bot-ssh-login" >> /etc/pam.d/sshd
 fi
 

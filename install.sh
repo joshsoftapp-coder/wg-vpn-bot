@@ -1,9 +1,17 @@
-#!/opt/homebrew/bin/bash
-#      !/usr/bin/env bash
-#      
+#!/usr/bin/env bash
 #
+# wg-vpn-bot installer
 #
-# wg-vpn-bot installer (v0.2)
+# Needs bash 4+ (Linux: works as-is; macOS: `brew install bash`;
+# Windows: untested — try WSL with gcloud installed inside it).
+# On macOS, `env bash` already resolves to homebrew's bash when brew is
+# in PATH; if it isn't (system bash 3.2 picked up), re-exec with the
+# homebrew binary directly (Apple Silicon, then Intel paths).
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  for _hb in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    if [ -x "$_hb" ]; then exec "$_hb" "$0" "$@"; fi
+  done
+fi  # otherwise fall through — preflight prints the friendly bash-4+ error
 # Creates a fresh GCP project + VM running WireGuard, managed via a Telegram bot.
 # Designed for the GCP free tier (us-* regions). Single-admin, IAP-protected SSH.
 #
@@ -16,7 +24,7 @@ set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
 # ---------- constants ----------
-SCRIPT_VERSION="0.2.11"
+SCRIPT_VERSION="0.3.0"
 FREE_TIER_REGIONS=("us-west1" "us-central1" "us-east1")
 DEFAULT_REGION="us-central1"
 DEFAULT_ZONE_SUFFIX="-a"
@@ -484,17 +492,15 @@ grant_iap() {
 # ---------- pairing token ----------
 
 gen_pairing_token() {
+  # /dev/urandom (not $RANDOM, which is a predictable LCG). Rejection
+  # sampling: accept bytes 0..247 (8*31) so modulo 31 is unbiased.
   local chars="ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-  local out=""
-  local i j
-  for i in 1 2 3; do
-    for j in 1 2 3 4; do
-      _=$j
-      out+="${chars:RANDOM%${#chars}:1}"
-    done
-    [[ $i -lt 3 ]] && out+="-"
+  local out="" byte
+  while (( ${#out} < 12 )); do
+    byte=$(od -An -N1 -tu1 /dev/urandom | tr -d ' ')
+    (( byte < 248 )) && out+="${chars:byte % 31:1}"
   done
-  printf '%s' "$out"
+  printf '%s-%s-%s' "${out:0:4}" "${out:4:4}" "${out:8:4}"
 }
 
 # ---------- vm creation ----------

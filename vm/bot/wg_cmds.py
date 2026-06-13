@@ -464,6 +464,11 @@ def render_client_conf(peer: Peer, server_endpoint: str) -> str:
         lines.append(f"PresharedKey = {peer.preshared_key}")
     lines += [
         f"Endpoint = {server_endpoint}:{port}",
+        "# AllowedIPs = everything. GCP free tier = 1 GB/month egress; heavy",
+        "# streaming through the VPN will exceed it. To bypass apps like",
+        "# Netflix/Zoom: Android WG app -> Excluded applications, or toggle",
+        "# the tunnel on only when needed. (WireGuard routes by IP, so",
+        "# domain-based exclusions are not possible here.)",
         "AllowedIPs = 0.0.0.0/0, ::/0",
         "PersistentKeepalive = 25",
     ]

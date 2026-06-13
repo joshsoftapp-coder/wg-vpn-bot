@@ -1,7 +1,6 @@
 """VM/host operations: status, reboot, shutdown, update, restart."""
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -91,52 +90,6 @@ def reboot() -> None:
 
 def shutdown() -> None:
     subprocess.Popen(["sudo", "/sbin/shutdown", "-h", "now"])
-
-
-def apt_dry_run() -> str:
-    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-    try:
-        subprocess.check_call(
-            ["sudo", "/usr/bin/apt-get", "update"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
-        )
-        out = subprocess.check_output(
-            ["sudo", "/usr/bin/apt-get", "-y", "-s", "upgrade"],
-            text=True, stderr=subprocess.STDOUT,
-            env=env,
-        )
-        pkgs = [ln.split()[1] for ln in out.splitlines() if ln.startswith("Inst ")]
-        if not pkgs:
-            return "No upgrades available."
-        return f"{len(pkgs)} package(s) would upgrade:\n  " + "\n  ".join(pkgs[:50])
-    except subprocess.CalledProcessError as e:
-        return f"apt-get failed: {e.output}"
-
-
-def apt_apply() -> str:
-    # DEBIAN_FRONTEND=noninteractive prevents dpkg maintainer scripts from
-    # prompting when run without a TTY. The conffile-conflict policy
-    # (--force-confold equivalent) is set on disk in /etc/apt/apt.conf.d via
-    # startup.sh, so the command here stays a plain 'apt-get -y upgrade' and
-    # the sudoers rule that authorises it can match exactly (no '=' in the
-    # command spec, which sudoers cannot parse).
-    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-    try:
-        subprocess.check_call(
-            ["sudo", "/usr/bin/apt-get", "update"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
-        )
-        out = subprocess.check_output(
-            ["sudo", "/usr/bin/apt-get", "-y", "upgrade"],
-            text=True, stderr=subprocess.STDOUT,
-            env=env,
-        )
-        pkgs = [ln.split()[1] for ln in out.splitlines() if ln.startswith("Setting up ")]
-        return f"Upgrade complete. {len(pkgs)} packages touched."
-    except subprocess.CalledProcessError as e:
-        return f"apt-get failed:\n{e.output[-1500:]}"
 
 
 def run_audit_summary() -> dict:

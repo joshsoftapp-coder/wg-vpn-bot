@@ -18,16 +18,6 @@ def is_admin(user_id: int) -> bool:
     return aid is not None and int(user_id) == aid
 
 
-def is_claimed_peer(user_id: int) -> str | None:
-    """Return peer name if this user_id has claimed a peer, else None."""
-    bindings = state.get("peer_chat_ids", {}) or {}
-    # bindings: {peer_name: user_id}
-    for name, uid in bindings.items():
-        if int(uid) == int(user_id):
-            return name
-    return None
-
-
 def try_pair(user_id: int, token: str) -> tuple[bool, str]:
     if config.admin_id() is not None:
         return False, (

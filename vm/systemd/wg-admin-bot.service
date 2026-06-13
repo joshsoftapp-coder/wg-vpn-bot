@@ -3,11 +3,19 @@ Description=WireGuard Admin Telegram Bot
 After=network-online.target wg-quick@wg0.service
 Wants=network-online.target
 OnFailure=wg-admin-bot-onfailure.service
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# Never give up: with a finite StartLimitBurst, a crash loop leaves the bot
+# permanently dead after the burst is exhausted — the worst outcome for a
+# VM expected to run unattended for months. RestartSec=30 paces the loop.
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec: the bot sends READY=1 when initialised and
+# WATCHDOG=1 every 60s from its tick loop (see _sd_notify in bot.py). A
+# hung-but-running bot (deadlock, stuck socket) misses pings and gets
+# killed + restarted. This replaces log-string liveness checks.
+Type=notify
+NotifyAccess=main
+WatchdogSec=300
 User=wgbot
 Group=wgbot
 WorkingDirectory=/opt/wg-admin-bot
@@ -19,7 +27,11 @@ ExecStartPre=+/bin/sh -c 'if [ ! -p /run/wg-bot.fifo ]; then rm -f /run/wg-bot.f
 
 ExecStart=/opt/wg-admin-bot/venv/bin/python3 /opt/wg-admin-bot/bot.py
 Restart=always
-RestartSec=10
+RestartSec=30
+
+# A slow leak gets the bot killed and restarted instead of OOMing the
+# whole 1 GB VM. Normal RSS is well under 150M.
+MemoryMax=300M
 
 StandardOutput=journal
 StandardError=journal
