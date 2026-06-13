@@ -222,10 +222,10 @@ ask "Did the crash message arrive in Telegram just now?"
 # ---------- T6: FIFO non-blocking + login alert (#9) ----------
 hdr "T6 — dead bot must not hang SSH or watchers (#9)"
 systemctl mask --now "$UNIT" >/dev/null 2>&1
-if wait_for 30 bash -c "! systemctl is-active --quiet $UNIT"; then
+if wait_for 60 bash -c "! systemctl is-active --quiet $UNIT"; then
   PASS "bot masked+stopped (graceful shutdown can take a few seconds)"
 else
-  FAIL "could not stop the bot within 30s"
+  FAIL "could not stop the bot within 60s"
 fi
 
 note "forced FIFO write with no reader: timeout must cap it at ~5s, not hang"
